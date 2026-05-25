@@ -2,7 +2,7 @@
 # Versions aligned with gemmakey reference implementation (ping840907/gemmakey)
 agp = "8.8.2"
 kotlin = "2.2.0"
-ksp = "2.2.0-1.0.29"
+ksp = "2.2.0-2.0.2"
 hilt = "2.58"
 composeBom = "2026.02.00"
 lifecycle = "2.8.7"
