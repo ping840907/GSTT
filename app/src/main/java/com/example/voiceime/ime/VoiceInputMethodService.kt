@@ -1,15 +1,18 @@
 package com.example.voiceime.ime
 
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.inputmethodservice.InputMethodService
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.VibrationEffect
 import android.os.VibratorManager
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -93,6 +96,16 @@ class VoiceInputMethodService : InputMethodService() {
         capturedScreenshot = null
         scope.cancel()
         super.onDestroy()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        // Release the ~2 GB Gemma engine when the system is critically short on memory.
+        // The engine will be re-initialized automatically on the next mic press.
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL && !isProcessing) {
+            gemmaManager.close()
+            statusLabel?.text = idleStatus()
+        }
     }
 
     // ── Keyboard view ─────────────────────────────────────────────────────────
@@ -234,6 +247,19 @@ class VoiceInputMethodService : InputMethodService() {
     // ── Mic press / release ───────────────────────────────────────────────────
 
     private fun onMicDown() {
+        // Re-initialize when the engine was released by onTrimMemory or previously errored.
+        when (gemmaManager.state) {
+            is EngineState.Error, is EngineState.Uninitialized -> {
+                statusLabel?.text = getString(R.string.model_loading)
+                scope.launch(Dispatchers.IO) {
+                    gemmaManager.initialize()
+                    withContext(Dispatchers.Main) { statusLabel?.text = idleStatus() }
+                }
+                return
+            }
+            is EngineState.Loading -> return   // still starting, ignore tap
+            is EngineState.Ready -> { /* proceed */ }
+        }
         if (isListening || isProcessing) return
         isListening = true
         vibrate(25)
@@ -316,7 +342,11 @@ class VoiceInputMethodService : InputMethodService() {
 
             override fun onPartialResults(partial: Bundle?) {
                 partial?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()?.let { partialAsrText = it }
+                    ?.firstOrNull()?.let {
+                        partialAsrText = it
+                        // Show live ASR progress so users know speech is being heard.
+                        if (it.isNotBlank()) statusLabel?.text = "「$it」"
+                    }
             }
 
             override fun onResults(results: Bundle?) {
@@ -348,6 +378,9 @@ class VoiceInputMethodService : InputMethodService() {
                 }
                 resetUi()
                 toast(asrErrorMessage(error))
+                if (error == SpeechRecognizer.ERROR_NOT_SUPPORTED) {
+                    openSpeechLanguageSettings()
+                }
                 Log.w(TAG, "ASR error: $error")
             }
         })
@@ -449,6 +482,20 @@ class VoiceInputMethodService : InputMethodService() {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     )
 
+    // Opens the Google app (where offline speech language packs are managed) so
+    // the user can download the zh-TW recognition model. Falls back to the app's
+    // system settings page if the Google app is absent.
+    private fun openSpeechLanguageSettings() {
+        val googlePkg = "com.google.android.googlequicksearchbox"
+        val intent = packageManager.getLaunchIntentForPackage(googlePkg)
+            ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ?: Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.parse("package:$googlePkg")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        runCatching { startActivity(intent) }
+    }
+
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
     private fun vibrate(ms: Long) = runCatching {
@@ -461,7 +508,7 @@ class VoiceInputMethodService : InputMethodService() {
         SpeechRecognizer.ERROR_NO_MATCH -> "未辨識到語音，請再說一次"
         SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "語音輸入逾時"
         SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "辨識器忙碌，請稍後再試"
-        SpeechRecognizer.ERROR_NOT_SUPPORTED -> "請安裝繁體中文離線語言包"
+        SpeechRecognizer.ERROR_NOT_SUPPORTED -> "請安裝繁體中文離線語言包（正在開啟設定…）"
         else -> "語音辨識錯誤（$code）"
     }
 

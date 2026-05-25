@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import javax.inject.Inject
@@ -62,24 +63,35 @@ class ModelDownloadManager @Inject constructor(
             val tempFile = File(destDir, "$MODEL_FILENAME.tmp")
             val finalFile = File(destDir, MODEL_FILENAME)
 
+            // Resume from where we left off if a partial download exists.
+            val resumeOffset = if (tempFile.exists()) tempFile.length() else 0L
+
             try {
                 val conn = URL(MODEL_URL).openConnection() as HttpURLConnection
                 conn.connectTimeout = 30_000
                 conn.readTimeout = 60_000
                 conn.instanceFollowRedirects = true
+                if (resumeOffset > 0) conn.setRequestProperty("Range", "bytes=$resumeOffset-")
                 conn.connect()
 
-                if (conn.responseCode != HttpURLConnection.HTTP_OK) {
+                val responseCode = conn.responseCode
+                val isResume = responseCode == HttpURLConnection.HTTP_PARTIAL  // 206
+                val isFull   = responseCode == HttpURLConnection.HTTP_OK       // 200
+                if (!isResume && !isFull) {
                     conn.disconnect()
-                    _state.value = DownloadState.Failed("伺服器錯誤 HTTP ${conn.responseCode}")
+                    _state.value = DownloadState.Failed("伺服器錯誤 HTTP $responseCode")
                     return@launch
                 }
 
-                val total = conn.contentLengthLong
-                var downloaded = 0L
+                // Server returned 200 (ignored Range header) — restart from 0.
+                val startOffset = if (isResume) resumeOffset else 0L
+                val remaining = conn.contentLengthLong
+                val total = if (remaining > 0) startOffset + remaining else -1L
+                var downloaded = startOffset
 
                 conn.inputStream.use { input ->
-                    tempFile.outputStream().use { output ->
+                    // append=true resumes writing; append=false overwrites on full-content 200.
+                    FileOutputStream(tempFile, isResume).use { output ->
                         val buf = ByteArray(65_536)
                         var n: Int
                         while (input.read(buf).also { n = it } != -1) {
@@ -105,7 +117,7 @@ class ModelDownloadManager @Inject constructor(
                 Log.i(TAG, "Model downloaded → ${finalFile.absolutePath}")
                 _state.value = DownloadState.Done
             } catch (e: kotlinx.coroutines.CancellationException) {
-                tempFile.delete()
+                // Keep tempFile so the next startDownload() can resume from the same offset.
                 _state.value = DownloadState.Idle
                 throw e
             } catch (e: Exception) {

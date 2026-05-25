@@ -55,7 +55,12 @@ class TranscriptionOrchestrator @Inject constructor(
                 screenshot = screenshot,
                 onPartialToken = onPartialToken
             )
-            parseOutput(raw, dictionaryDao)
+            val result = parseOutput(raw, dictionaryDao)
+            // Increment usage counter for confirmed dictionary terms found in the output,
+            // so getTopTerms() returns the most contextually relevant terms first.
+            dictTerms.filter { result.text.contains(it) }
+                .forEach { runCatching { dictionaryDao.incrementUsage(it) } }
+            result
         } catch (e: Exception) {
             Log.e(TAG, "Gemma failed — returning raw ASR text as-is", e)
             TranscriptionResult(roughText, emptyList())
