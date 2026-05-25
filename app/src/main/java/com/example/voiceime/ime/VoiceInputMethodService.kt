@@ -22,6 +22,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -75,6 +76,12 @@ class VoiceInputMethodService : InputMethodService() {
     private var isListening = false
     private var isProcessing = false
 
+    // The text most recently committed — used to replace it when the user picks a candidate.
+    private var lastCommittedText = ""
+
+    // Candidate bar views (created lazily by onCreateCandidatesView).
+    private var candidateRow: LinearLayout? = null
+
     private var statusLabel: TextView? = null
     private var micButton: ImageButton? = null
     private var progressBar: ProgressBar? = null
@@ -106,6 +113,71 @@ class VoiceInputMethodService : InputMethodService() {
             gemmaManager.close()
             statusLabel?.text = idleStatus()
         }
+    }
+
+    // ── Candidate bar (IME framework slot above the keyboard) ─────────────────
+
+    override fun onCreateCandidatesView(): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+        }
+        candidateRow = row
+        return HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            setBackgroundColor(Color.parseColor("#EEF2F8"))
+            addView(row)
+        }
+    }
+
+    private fun showCandidates(alternatives: List<String>) {
+        if (alternatives.isEmpty()) { hideCandidateBar(); return }
+        // setCandidatesViewShown(true) triggers onCreateCandidatesView() if not yet created,
+        // setting candidateRow synchronously on the main thread before we return.
+        setCandidatesViewShown(true)
+        val row = candidateRow ?: return
+        row.removeAllViews()
+        alternatives.forEach { row.addView(buildCandidateChip(it)) }
+    }
+
+    private fun hideCandidateBar() {
+        candidateRow?.removeAllViews()
+        setCandidatesViewShown(false)
+        lastCommittedText = ""
+    }
+
+    private fun buildCandidateChip(text: String): TextView =
+        TextView(this).apply {
+            this.text = text
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(BLUE)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(16).toFloat()
+                setColor(Color.parseColor("#DDEEFF"))
+                setStroke(dp(1), Color.parseColor("#90CAF9"))
+            }
+            setPadding(dp(14), dp(5), dp(14), dp(5))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.marginEnd = dp(8) }
+            setOnClickListener { selectCandidate(text) }
+        }
+
+    private fun selectCandidate(candidate: String) {
+        val ic = currentInputConnection ?: return
+        // Only replace if the cursor is still immediately after the last committed text.
+        // This guards against the user having typed or deleted since the commit.
+        val before = ic.getTextBeforeCursor(lastCommittedText.length, 0)?.toString()
+        if (before == lastCommittedText) {
+            ic.deleteSurroundingText(lastCommittedText.length, 0)
+            ic.commitText(candidate, 1)
+            lastCommittedText = candidate
+            vibrate(18)
+        }
+        hideCandidateBar()
     }
 
     // ── Keyboard view ─────────────────────────────────────────────────────────
@@ -185,6 +257,7 @@ class VoiceInputMethodService : InputMethodService() {
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     v.isPressed = true
+                    hideCandidateBar()          // first backspace invalidates last commit
                     backspaceJob?.cancel()
                     backspaceJob = scope.launch {
                         performBackspace()                  // immediate first delete
@@ -261,6 +334,7 @@ class VoiceInputMethodService : InputMethodService() {
             is EngineState.Ready -> { /* proceed */ }
         }
         if (isListening || isProcessing) return
+        hideCandidateBar()          // clear previous candidates when starting a new session
         isListening = true
         vibrate(25)
         setUiState(UiMode.RECORDING)
@@ -420,10 +494,12 @@ class VoiceInputMethodService : InputMethodService() {
             withContext(Dispatchers.Main) {
                 if (result.text.isNotBlank()) {
                     currentInputConnection?.commitText(result.text, 1)
+                    lastCommittedText = result.text
                     vibrate(18)
                 }
                 isProcessing = false
                 resetUi()
+                showCandidates(result.alternatives)
             }
         }
     }
@@ -436,6 +512,7 @@ class VoiceInputMethodService : InputMethodService() {
     }
 
     private fun performEnter() {
+        hideCandidateBar()
         val ic = currentInputConnection ?: return
         val action = (currentInputEditorInfo?.imeOptions ?: 0) and EditorInfo.IME_MASK_ACTION
         if (action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) {

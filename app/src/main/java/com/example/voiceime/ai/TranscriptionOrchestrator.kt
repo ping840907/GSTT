@@ -14,6 +14,8 @@ private const val DICT_MAX_TERMS = 50
 
 data class TranscriptionResult(
     val text: String,
+    /** Lower-confidence alternative transcriptions for user selection. */
+    val alternatives: List<String>,
     val detectedTerms: List<String>
 )
 
@@ -43,7 +45,7 @@ class TranscriptionOrchestrator @Inject constructor(
         screenshot: Bitmap?,
         onPartialToken: ((String) -> Unit)? = null
     ): TranscriptionResult = withContext(Dispatchers.IO) {
-        if (roughText.isBlank()) return@withContext TranscriptionResult("", emptyList())
+        if (roughText.isBlank()) return@withContext TranscriptionResult("", emptyList(), emptyList())
 
         val dictTerms = dictionaryDao.getTopTerms(DICT_MAX_TERMS)
         val prompt = buildPrompt(roughText, screenText.take(SCREEN_TEXT_MAX_CHARS), dictTerms, screenshot != null)
@@ -63,7 +65,7 @@ class TranscriptionOrchestrator @Inject constructor(
             result
         } catch (e: Exception) {
             Log.e(TAG, "Gemma failed — returning raw ASR text as-is", e)
-            TranscriptionResult(roughText, emptyList())
+            TranscriptionResult(roughText, emptyList(), emptyList())
         } finally {
             screenshot?.recycle()
         }
@@ -102,6 +104,13 @@ class TranscriptionOrchestrator @Inject constructor(
             ?: raw.lines().firstOrNull { it.isNotBlank() }
             ?: raw.trim()
 
+        val alternatives = RE_ALTS.find(raw)?.groupValues?.get(1)?.trim()
+            ?.split("|")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() && it != text && it.length <= text.length * 3 }
+            ?.take(2)
+            ?: emptyList()
+
         val terms = RE_TERMS.find(raw)?.groupValues?.get(1)?.trim()
             ?.split(",")
             ?.map { it.trim() }
@@ -109,11 +118,12 @@ class TranscriptionOrchestrator @Inject constructor(
             ?: emptyList()
 
         terms.forEach { runCatching { dao.addCandidateTerm(it) } }
-        return TranscriptionResult(text, terms)
+        return TranscriptionResult(text, alternatives, terms)
     }
 
     companion object {
-        private val RE_TEXT = Regex("\\[TEXT](.*?)\\[/TEXT]", RegexOption.DOT_MATCHES_ALL)
+        private val RE_TEXT  = Regex("\\[TEXT](.*?)\\[/TEXT]",   RegexOption.DOT_MATCHES_ALL)
+        private val RE_ALTS  = Regex("\\[ALTS](.*?)\\[/ALTS]",   RegexOption.DOT_MATCHES_ALL)
         private val RE_TERMS = Regex("\\[TERMS](.*?)\\[/TERMS]", RegexOption.DOT_MATCHES_ALL)
 
         private val SYSTEM_INSTRUCTION = """
@@ -135,8 +145,14 @@ class TranscriptionOrchestrator @Inject constructor(
             2. 若有截圖，僅用於理解使用情境（正在用哪個 App、輸入框的語境），不得引用截圖文字
             3. 「自訂詞彙」的正確拼法優先於其他來源
 
+            ══ 替代選項規則 ══
+            • [ALTS] 提供 1-2 個匹配度次高的替代選項（不同諧音詮釋或語意解讀）
+            • 替代選項不得與 [TEXT] 完全相同；若無合理替代則留空
+            • 多個選項以 | 分隔，例如：[ALTS]選項甲|選項乙[/ALTS]
+
             ══ 輸出格式（必須嚴格遵守，不得輸出任何其他說明）══
             [TEXT]最終校正文字[/TEXT]
+            [ALTS]替代選項，以 | 分隔；無則留空[/ALTS]
             [TERMS]本次辨識到的新特殊詞彙，逗號分隔；若無則留空[/TERMS]
         """.trimIndent()
     }
