@@ -7,12 +7,10 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.inputmethodservice.InputMethodService
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.VibrationEffect
 import android.os.VibratorManager
-import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -61,6 +59,11 @@ class VoiceInputMethodService : InputMethodService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     private var speechRecognizer: SpeechRecognizer? = null
+
+    // Tracks whether the current recognizer is the on-device variant.
+    // Set false once on-device returns error 11/12 so future builds skip it.
+    private var isUsingOnDevice = false
+    private var onDeviceFailed = false
 
     // Screen context captured at recording start (UI is most stable at that moment)
     private var capturedScreenText = ""
@@ -397,8 +400,10 @@ class VoiceInputMethodService : InputMethodService() {
     }
 
     private fun buildSpeechRecognizer(): SpeechRecognizer {
-        val useOnDevice = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+        val useOnDevice = !onDeviceFailed &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                 SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
+        isUsingOnDevice = useOnDevice
         val sr = if (useOnDevice) {
             Log.i(TAG, "Using on-device SpeechRecognizer (API ${Build.VERSION.SDK_INT})")
             SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
@@ -450,11 +455,19 @@ class VoiceInputMethodService : InputMethodService() {
                     processWithGemma(rough)
                     return
                 }
+                // On-device recognizer lacks zh-TW — retry once with the default recognizer.
+                if ((error == ASR_LANGUAGE_NOT_SUPPORTED || error == ASR_LANGUAGE_UNAVAILABLE)
+                    && isUsingOnDevice) {
+                    Log.w(TAG, "On-device ASR zh-TW unsupported (err $error), retrying with default recognizer")
+                    onDeviceFailed = true
+                    isListening = true
+                    try { startSpeechRecognizer(); return } catch (e: Exception) {
+                        isListening = false
+                        Log.e(TAG, "Default recognizer fallback failed", e)
+                    }
+                }
                 resetUi()
                 toast(asrErrorMessage(error))
-                if (error == ASR_LANGUAGE_NOT_SUPPORTED || error == ASR_LANGUAGE_UNAVAILABLE) {
-                    openSpeechLanguageSettings()
-                }
                 Log.w(TAG, "ASR error: $error")
             }
         })
@@ -559,21 +572,7 @@ class VoiceInputMethodService : InputMethodService() {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     )
 
-    // Opens the Google app (where offline speech language packs are managed) so
-    // the user can download the zh-TW recognition model. Falls back to the app's
-    // system settings page if the Google app is absent.
-    private fun openSpeechLanguageSettings() {
-        val googlePkg = "com.google.android.googlequicksearchbox"
-        val intent = packageManager.getLaunchIntentForPackage(googlePkg)
-            ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            ?: Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                data = Uri.parse("package:$googlePkg")
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-        runCatching { startActivity(intent) }
-    }
-
-    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
     private fun vibrate(ms: Long) = runCatching {
         (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager)
@@ -585,7 +584,7 @@ class VoiceInputMethodService : InputMethodService() {
         SpeechRecognizer.ERROR_NO_MATCH -> "未辨識到語音，請再說一次"
         SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "語音輸入逾時"
         SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "辨識器忙碌，請稍後再試"
-        ASR_LANGUAGE_NOT_SUPPORTED, ASR_LANGUAGE_UNAVAILABLE -> "請安裝繁體中文離線語言包（正在開啟設定…）"
+        ASR_LANGUAGE_NOT_SUPPORTED, ASR_LANGUAGE_UNAVAILABLE -> "繁體中文語音辨識不可用，請確認已安裝語言包"
         else -> "語音辨識錯誤（$code）"
     }
 
