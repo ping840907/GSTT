@@ -6,10 +6,10 @@ import kotlinx.coroutines.flow.Flow
 @Dao
 interface DictionaryDao {
 
-    @Query("SELECT * FROM dictionary WHERE isCandidate = 0 ORDER BY usageCount DESC, addedAt DESC")
+    @Query("SELECT * FROM dictionary WHERE isCandidate = 0 ORDER BY usageCount DESC, addedAt DESC LIMIT 200")
     fun observeConfirmed(): Flow<List<DictionaryEntry>>
 
-    @Query("SELECT * FROM dictionary WHERE isCandidate = 1 ORDER BY addedAt DESC")
+    @Query("SELECT * FROM dictionary WHERE isCandidate = 1 ORDER BY addedAt DESC LIMIT 200")
     fun observeCandidates(): Flow<List<DictionaryEntry>>
 
     @Query("SELECT term FROM dictionary WHERE isCandidate = 0 ORDER BY usageCount DESC LIMIT :limit")

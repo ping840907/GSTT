@@ -199,6 +199,7 @@ private fun DictionaryScreen(
                             || downloadState is DownloadState.Done,
                     engineState = viewModel.gemmaManager.state,
                     ramTier = viewModel.deviceCapability.tier,
+                    socVendor = viewModel.gemmaManager.socVendorLabel,
                     onDownload = { viewModel.modelDownload.startDownload() },
                     onCancel = { viewModel.modelDownload.cancelDownload() }
                 )
@@ -311,6 +312,7 @@ private fun ModelDownloadCard(
     isInstalled: Boolean,
     engineState: EngineState,
     ramTier: Int,
+    socVendor: String,
     onDownload: () -> Unit,
     onCancel: () -> Unit
 ) {
@@ -425,6 +427,9 @@ private fun ModelDownloadCard(
                     fontSize = 11.sp,
                     color = Color.Gray
                 )
+                if (socVendor.isNotEmpty()) {
+                    Text("SoC：$socVendor", fontSize = 11.sp, color = Color.Gray)
+                }
             }
 
             // Failed: show error

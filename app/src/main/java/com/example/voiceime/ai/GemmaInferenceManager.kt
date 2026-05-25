@@ -58,11 +58,21 @@ class GemmaInferenceManager @Inject constructor(
     private val deviceCapability: DeviceCapability
 ) {
     @Volatile private var engine: Engine? = null
+    @Volatile private var detectedSocVendor: SocVendor = SocVendor.UNKNOWN
     private var activeBackend: String = "CPU"
 
     @Volatile
     var state: EngineState = EngineState.Uninitialized
         private set
+
+    /** Human-readable SoC vendor name, populated after first initialize() call. */
+    val socVendorLabel: String
+        get() = when (detectedSocVendor) {
+            SocVendor.QUALCOMM -> "Qualcomm"
+            SocVendor.MEDIATEK -> "MediaTek"
+            SocVendor.GOOGLE_TENSOR -> "Google Tensor"
+            SocVendor.UNKNOWN -> Build.SOC_MANUFACTURER.ifBlank { "未知" }
+        }
 
     // Guards concurrent initialize() calls — prevents double engine creation.
     private val initMutex = Mutex()
@@ -74,6 +84,9 @@ class GemmaInferenceManager @Inject constructor(
         initMutex.withLock {
             // Double-check after acquiring lock — a concurrent call may have finished first.
             if (state is EngineState.Ready) return@withLock state
+            // Close any stale engine from a previous partial or failed init.
+            engine?.close()
+            engine = null
             state = EngineState.Loading
             Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
 
@@ -84,6 +97,7 @@ class GemmaInferenceManager @Inject constructor(
             }
 
             val vendor = detectSocVendor()
+            detectedSocVendor = vendor
             val (eng, backendLabel) = tryCreateEngine(modelPath, vendor)
             if (eng == null) {
                 return@withContext EngineState.Error("模型初始化失敗，請確認裝置記憶體是否充足。")
@@ -113,11 +127,15 @@ class GemmaInferenceManager @Inject constructor(
     //              The Gemma 4 image bug (Issue #1874) is fixed in current LiteRT-LM;
     //              we still keep a graceful fallback for pre-patch builds.
     //   • Text   — Screen text + rough ASR transcript + dictionary, all in [textPrompt].
+    //
+    // [onPartialToken] is invoked on LiteRT-LM's callback thread for each generated
+    // token; callers must marshal UI updates to the main thread themselves.
 
     suspend fun transcribeOnce(
         systemInstruction: String,
         textPrompt: String,
-        screenshot: Bitmap?
+        screenshot: Bitmap?,
+        onPartialToken: ((String) -> Unit)? = null
     ): String = withContext(Dispatchers.IO) {
         val eng = engine ?: error("Engine not initialised — call initialize() first")
         var conversation: Conversation? = null
@@ -133,9 +151,9 @@ class GemmaInferenceManager @Inject constructor(
             )
 
             if (screenshot != null) {
-                tryWithImage(conversation, textPrompt, screenshot)
+                tryWithImage(conversation, textPrompt, screenshot, onPartialToken)
             } else {
-                sendText(conversation, textPrompt)
+                sendText(conversation, textPrompt, onPartialToken)
             }
         } finally {
             conversation?.close()
@@ -148,13 +166,14 @@ class GemmaInferenceManager @Inject constructor(
     private suspend fun tryWithImage(
         conversation: Conversation,
         textPrompt: String,
-        bitmap: Bitmap
+        bitmap: Bitmap,
+        onPartialToken: ((String) -> Unit)? = null
     ): String {
         // Heap guard: PNG encoding + KV-cache allocation ≈ 5× raw bitmap size.
         val estimatedMb = (bitmap.byteCount.toLong() * 5 / 1_048_576L).toInt().coerceAtLeast(30)
         if (!deviceCapability.hasHeapFor(estimatedMb)) {
             Log.w(TAG, "Heap guard: skipping image  est=${estimatedMb}MB")
-            return sendText(conversation, textPrompt)
+            return sendText(conversation, textPrompt, onPartialToken)
         }
 
         return try {
@@ -166,7 +185,11 @@ class GemmaInferenceManager @Inject constructor(
 
                 conversation.sendMessageAsync(contents, object : MessageCallback {
                     override fun onMessage(message: Message) {
-                        if (active.get()) sb.append(message.toString())
+                        if (active.get()) {
+                            val token = message.toString()
+                            sb.append(token)
+                            onPartialToken?.invoke(token)
+                        }
                     }
                     override fun onDone() {
                         if (active.compareAndSet(true, false)) cont.resume(sb.toString().trim())
@@ -187,34 +210,41 @@ class GemmaInferenceManager @Inject constructor(
             }
         } catch (_: ImageRejectedByRuntimeException) {
             Log.i(TAG, "Image rejected by pre-patch LiteRT-LM — retrying text-only")
-            sendText(conversation, textPrompt)
+            sendText(conversation, textPrompt, onPartialToken)
         }
     }
 
-    private suspend fun sendText(conversation: Conversation, textPrompt: String): String =
-        suspendCancellableCoroutine { cont ->
-            val active = AtomicBoolean(true)
-            val sb = StringBuilder()
-            conversation.sendMessageAsync(
-                Contents.of(listOf(Content.Text(textPrompt))),
-                object : MessageCallback {
-                    override fun onMessage(message: Message) {
-                        if (active.get()) sb.append(message.toString())
+    private suspend fun sendText(
+        conversation: Conversation,
+        textPrompt: String,
+        onPartialToken: ((String) -> Unit)? = null
+    ): String = suspendCancellableCoroutine { cont ->
+        val active = AtomicBoolean(true)
+        val sb = StringBuilder()
+        conversation.sendMessageAsync(
+            Contents.of(listOf(Content.Text(textPrompt))),
+            object : MessageCallback {
+                override fun onMessage(message: Message) {
+                    if (active.get()) {
+                        val token = message.toString()
+                        sb.append(token)
+                        onPartialToken?.invoke(token)
                     }
-                    override fun onDone() {
-                        if (active.compareAndSet(true, false)) cont.resume(sb.toString().trim())
+                }
+                override fun onDone() {
+                    if (active.compareAndSet(true, false)) cont.resume(sb.toString().trim())
+                }
+                override fun onError(throwable: Throwable) {
+                    if (active.compareAndSet(true, false)) {
+                        Log.e(TAG, "Text inference error", throwable)
+                        cont.resumeWithException(throwable)
                     }
-                    override fun onError(throwable: Throwable) {
-                        if (active.compareAndSet(true, false)) {
-                            Log.e(TAG, "Text inference error", throwable)
-                            cont.resumeWithException(throwable)
-                        }
-                    }
-                },
-                emptyMap()
-            )
-            cont.invokeOnCancellation { active.set(false) }
-        }
+                }
+            },
+            emptyMap()
+        )
+        cont.invokeOnCancellation { active.set(false) }
+    }
 
     // ── Backend selection (mirrors gemmakey) ──────────────────────────────────
 
@@ -228,7 +258,8 @@ class GemmaInferenceManager @Inject constructor(
         if (vendor == SocVendor.GOOGLE_TENSOR) {
             Log.i(TAG, "Google Tensor NPU requires AOT model — using GPU")
         }
-        runCatching { buildEngine(modelPath, Backend.GPU(), Backend.CPU()) }
+        // Both compute and vision backend use GPU for correct multimodal performance.
+        runCatching { buildEngine(modelPath, Backend.GPU(), Backend.GPU()) }
             .onSuccess { return it to "GPU" }
             .onFailure { Log.w(TAG, "GPU unavailable: ${it.message}") }
         runCatching { buildEngine(modelPath, Backend.CPU(), Backend.CPU()) }

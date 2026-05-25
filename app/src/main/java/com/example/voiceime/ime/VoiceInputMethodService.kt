@@ -371,7 +371,17 @@ class VoiceInputMethodService : InputMethodService() {
             capturedScreenshot = null   // ownership transferred to orchestrator
             capturedScreenText = ""
 
-            val result = orchestrator.transcribe(roughText, screenText, screenshot)
+            val partialBuf = StringBuilder()
+            val result = orchestrator.transcribe(roughText, screenText, screenshot) { token ->
+                // Called on LiteRT-LM's thread — post UI update to main thread via View.
+                partialBuf.append(token)
+                val preview = partialBuf.toString()
+                    .removePrefix("[TEXT]")
+                    .substringBefore("[/TEXT]")
+                    .trim()
+                    .takeLast(40)
+                if (preview.isNotBlank()) statusLabel?.post { statusLabel?.text = preview }
+            }
             // screenshot recycled inside orchestrator.finally{}
 
             withContext(Dispatchers.Main) {

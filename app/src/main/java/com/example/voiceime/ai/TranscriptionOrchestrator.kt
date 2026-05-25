@@ -35,11 +35,13 @@ class TranscriptionOrchestrator @Inject constructor(
      *   Text   → [screenText] + [roughText] + dictionary terms assembled into one prompt.
      *
      * [screenshot] is recycled before this function returns — no reference escapes.
+     * [onPartialToken] is forwarded to GemmaInferenceManager; callers marshal UI updates.
      */
     suspend fun transcribe(
         roughText: String,
         screenText: String,
-        screenshot: Bitmap?
+        screenshot: Bitmap?,
+        onPartialToken: ((String) -> Unit)? = null
     ): TranscriptionResult = withContext(Dispatchers.IO) {
         if (roughText.isBlank()) return@withContext TranscriptionResult("", emptyList())
 
@@ -50,7 +52,8 @@ class TranscriptionOrchestrator @Inject constructor(
             val raw = gemma.transcribeOnce(
                 systemInstruction = SYSTEM_INSTRUCTION,
                 textPrompt = prompt,
-                screenshot = screenshot
+                screenshot = screenshot,
+                onPartialToken = onPartialToken
             )
             parseOutput(raw, dictionaryDao)
         } catch (e: Exception) {
@@ -90,13 +93,11 @@ class TranscriptionOrchestrator @Inject constructor(
     }
 
     private suspend fun parseOutput(raw: String, dao: DictionaryDao): TranscriptionResult {
-        val text = Regex("\\[TEXT](.*?)\\[/TEXT]", RegexOption.DOT_MATCHES_ALL)
-            .find(raw)?.groupValues?.get(1)?.trim()
+        val text = RE_TEXT.find(raw)?.groupValues?.get(1)?.trim()
             ?: raw.lines().firstOrNull { it.isNotBlank() }
             ?: raw.trim()
 
-        val terms = Regex("\\[TERMS](.*?)\\[/TERMS]", RegexOption.DOT_MATCHES_ALL)
-            .find(raw)?.groupValues?.get(1)?.trim()
+        val terms = RE_TERMS.find(raw)?.groupValues?.get(1)?.trim()
             ?.split(",")
             ?.map { it.trim() }
             ?.filter { it.length in 2..20 && it.isNotBlank() }
@@ -107,6 +108,9 @@ class TranscriptionOrchestrator @Inject constructor(
     }
 
     companion object {
+        private val RE_TEXT = Regex("\\[TEXT](.*?)\\[/TEXT]", RegexOption.DOT_MATCHES_ALL)
+        private val RE_TERMS = Regex("\\[TERMS](.*?)\\[/TERMS]", RegexOption.DOT_MATCHES_ALL)
+
         private val SYSTEM_INSTRUCTION = """
             你是一個嚴格的語音轉文字校正助手，在繁體中文環境中運作。所有處理完全在本機離線完成。
 
