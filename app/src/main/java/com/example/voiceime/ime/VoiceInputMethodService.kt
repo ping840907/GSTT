@@ -670,7 +670,7 @@ class VoiceInputMethodService : InputMethodService() {
                 UiMode.PROCESSING -> Color.parseColor("#757575")
             }
         )
-        micButton?.isEnabled = mode == UiMode.IDLE
+        micButton?.isEnabled = mode != UiMode.PROCESSING
     }
 
     private fun resetUi() {
