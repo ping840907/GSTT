@@ -13,6 +13,11 @@
         android:allowBackup="false"
         android:extractNativeLibs="true">
 
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false" />
+
+
         <!-- Keyboard IME Service -->
         <service
             android:name=".ime.VoiceInputMethodService"

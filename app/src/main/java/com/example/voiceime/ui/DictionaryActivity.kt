@@ -75,12 +75,12 @@ class DictionaryViewModel @Inject constructor(
     var useScreenshot by mutableStateOf(modalitySettings.useScreenshot)
         private set
 
-    fun setUseScreenText(enabled: Boolean) {
+    fun updateScreenText(enabled: Boolean) {
         useScreenText = enabled
         modalitySettings.useScreenText = enabled
     }
 
-    fun setUseScreenshot(enabled: Boolean) {
+    fun updateScreenshot(enabled: Boolean) {
         useScreenshot = enabled
         modalitySettings.useScreenshot = enabled
     }
@@ -223,8 +223,8 @@ private fun DictionaryScreen(
                 ModalitySettingsCard(
                     useScreenText = viewModel.useScreenText,
                     useScreenshot = viewModel.useScreenshot,
-                    onScreenTextChange = viewModel::setUseScreenText,
-                    onScreenshotChange = viewModel::setUseScreenshot
+                    onScreenTextChange = viewModel::updateScreenText,
+                    onScreenshotChange = viewModel::updateScreenshot
                 )
             }
 

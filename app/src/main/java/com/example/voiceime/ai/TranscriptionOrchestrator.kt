@@ -57,7 +57,9 @@ class TranscriptionOrchestrator @Inject constructor(
                 screenshot = screenshot,
                 onPartialToken = onPartialToken
             )
+            Log.d(TAG, "Raw model output:\n$raw")
             val result = parseOutput(raw, dictionaryDao)
+            Log.d(TAG, "Parsed result: text='${result.text}' alternatives=${result.alternatives} terms=${result.detectedTerms}")
             // Increment usage counter for confirmed dictionary terms found in the output,
             // so getTopTerms() returns the most contextually relevant terms first.
             dictTerms.filter { result.text.contains(it) }
@@ -104,12 +106,12 @@ class TranscriptionOrchestrator @Inject constructor(
             ?: raw.lines().firstOrNull { it.isNotBlank() }
             ?: raw.trim()
 
-        val alternatives = RE_ALTS.find(raw)?.groupValues?.get(1)?.trim()
-            ?.split("|")
-            ?.map { it.trim() }
-            ?.filter { it.isNotBlank() && it != text && it.length <= text.length * 3 }
-            ?.take(2)
-            ?: emptyList()
+        val rawAlts = RE_ALTS.find(raw)?.groupValues?.get(1)?.trim() ?: ""
+        val alternatives = if (rawAlts.isBlank()) emptyList() else rawAlts
+            .split(Regex("[|，,、]"))
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it != text && it.length <= text.length * 3 }
+            .take(2)
 
         val terms = RE_TERMS.find(raw)?.groupValues?.get(1)?.trim()
             ?.split(",")

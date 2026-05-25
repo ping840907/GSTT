@@ -7,7 +7,6 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.inputmethodservice.InputMethodService
-import android.os.Build
 import android.os.Bundle
 import android.os.VibrationEffect
 import android.os.VibratorManager
@@ -22,6 +21,7 @@ import android.view.inputmethod.EditorInfo
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -60,11 +60,6 @@ class VoiceInputMethodService : InputMethodService() {
 
     private var speechRecognizer: SpeechRecognizer? = null
 
-    // Tracks whether the current recognizer is the on-device variant.
-    // Set false once on-device returns error 11/12 so future builds skip it.
-    private var isUsingOnDevice = false
-    private var onDeviceFailed = false
-
     // Screen context captured at recording start (UI is most stable at that moment)
     private var capturedScreenText = ""
     private var capturedScreenshot: Bitmap? = null
@@ -89,12 +84,16 @@ class VoiceInputMethodService : InputMethodService() {
     private var micButton: ImageButton? = null
     private var progressBar: ProgressBar? = null
     private var pulseRing: View? = null
+    private var backendChip: TextView? = null
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
-        scope.launch(Dispatchers.IO) { gemmaManager.initialize() }
+        scope.launch(Dispatchers.IO) {
+            gemmaManager.initialize()
+            withContext(Dispatchers.Main) { updateBackendChip() }
+        }
     }
 
     override fun onDestroy() {
@@ -130,6 +129,13 @@ class VoiceInputMethodService : InputMethodService() {
             isHorizontalScrollBarEnabled = false
             setBackgroundColor(Color.parseColor("#EEF2F8"))
             addView(row)
+        }
+    }
+
+    override fun onComputeInsets(outInsets: InputMethodService.Insets) {
+        super.onComputeInsets(outInsets)
+        if (!isFullscreenMode) {
+            outInsets.contentTopInsets = outInsets.visibleTopInsets
         }
     }
 
@@ -255,7 +261,7 @@ class VoiceInputMethodService : InputMethodService() {
             setPadding(dp(16), dp(4), dp(16), dp(4))
         }
 
-        val backspaceBtn = buildFuncKey("⌫", "刪除", onClick = null)
+        val backspaceBtn = buildFuncKey(R.drawable.ic_backspace, "刪除")
         backspaceBtn.setOnTouchListener { v, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
@@ -284,39 +290,57 @@ class VoiceInputMethodService : InputMethodService() {
         funcRow.addView(backspaceBtn, LinearLayout.LayoutParams(dp(80), dp(44)))
         funcRow.addView(View(this),                               // spacer
             LinearLayout.LayoutParams(0, 1, 1f))
-        funcRow.addView(buildFuncKey("↵", "換行/確認") { performEnter() },
+        funcRow.addView(buildFuncKey(R.drawable.ic_enter, "換行/確認") { performEnter() },
             LinearLayout.LayoutParams(dp(80), dp(44)))
         root.addView(funcRow, LinearLayout.LayoutParams(mp, wc))
 
-        // ── Dictionary bar ────────────────────────────────────────────────────
+        // ── Bottom bar: [📖 字典] ───────── [backend chip] ───────────────────
         val bar = LinearLayout(this).apply {
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dp(8))
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), 0, dp(12), dp(8))
         }
         bar.addView(TextView(this).apply {
             text = "📖 字典"
             textSize = 12f
             setTextColor(Color.parseColor("#1565C0"))
-            setPadding(dp(16), dp(6), dp(16), dp(6))
+            setPadding(dp(12), dp(6), dp(12), dp(6))
             setOnClickListener { openDictionary() }
-        })
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        bar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))   // spacer
+        backendChip = TextView(this).apply {
+            textSize = 11f
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(10).toFloat()
+            }
+            visibility = View.INVISIBLE
+        }
+        updateBackendChip()
+        bar.addView(backendChip, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         root.addView(bar, LinearLayout.LayoutParams(mp, wc))
 
         return root
     }
 
-    private fun buildFuncKey(label: String, contentDesc: String, onClick: (() -> Unit)?): TextView =
-        TextView(this).apply {
-            text = label
+    private fun buildFuncKey(
+        iconRes: Int,
+        contentDesc: String,
+        onClick: (() -> Unit)? = null
+    ): ImageView = ImageView(this).apply {
+            setImageResource(iconRes)
             contentDescription = contentDesc
-            textSize = 20f
-            gravity = Gravity.CENTER
-            setTextColor(BLUE)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setColorFilter(BLUE)
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = dp(10).toFloat()
                 setColor(Color.parseColor("#E3EBF8"))
             }
+            val paddingHorizontal = dp(24)
+            val paddingVertical = dp(11)
+            setPadding(paddingHorizontal, paddingVertical, paddingHorizontal, paddingVertical)
             if (onClick != null) setOnClickListener { onClick() }
         }
 
@@ -377,20 +401,21 @@ class VoiceInputMethodService : InputMethodService() {
     }
 
     // ── SpeechRecognizer ──────────────────────────────────────────────────────
-    //
-    // createOnDeviceSpeechRecognizer requires API 33+ and an on-device recognition
-    // service. Falls back to createSpeechRecognizer with PREFER_OFFLINE on earlier
-    // APIs or when on-device is unavailable.
 
     private fun startSpeechRecognizer() {
         partialAsrText = ""
         if (speechRecognizer == null) {
+            if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                toast("此裝置不支援語音辨識")
+                isListening = false
+                resetUi()
+                return
+            }
             speechRecognizer = buildSpeechRecognizer()
         }
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "zh-TW")
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
@@ -400,17 +425,8 @@ class VoiceInputMethodService : InputMethodService() {
     }
 
     private fun buildSpeechRecognizer(): SpeechRecognizer {
-        val useOnDevice = !onDeviceFailed &&
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
-        isUsingOnDevice = useOnDevice
-        val sr = if (useOnDevice) {
-            Log.i(TAG, "Using on-device SpeechRecognizer (API ${Build.VERSION.SDK_INT})")
-            SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
-        } else {
-            Log.i(TAG, "Using default SpeechRecognizer with PREFER_OFFLINE")
-            SpeechRecognizer.createSpeechRecognizer(this)
-        }
+        Log.i(TAG, "Creating SpeechRecognizer")
+        val sr = SpeechRecognizer.createSpeechRecognizer(this)
         sr.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {}
             override fun onBeginningOfSpeech() {}
@@ -423,7 +439,6 @@ class VoiceInputMethodService : InputMethodService() {
                 partial?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull()?.let {
                         partialAsrText = it
-                        // Show live ASR progress so users know speech is being heard.
                         if (it.isNotBlank()) statusLabel?.text = "「$it」"
                     }
             }
@@ -444,8 +459,6 @@ class VoiceInputMethodService : InputMethodService() {
 
             override fun onError(error: Int) {
                 isListening = false
-                // Destroy the recognizer on error — a stale instance may not recover
-                // reliably for the next startListening() call.
                 speechRecognizer?.destroy()
                 speechRecognizer = null
 
@@ -454,17 +467,6 @@ class VoiceInputMethodService : InputMethodService() {
                     Log.w(TAG, "ASR error $error — using partial result: \"$rough\"")
                     processWithGemma(rough)
                     return
-                }
-                // On-device recognizer lacks zh-TW — retry once with the default recognizer.
-                if ((error == ASR_LANGUAGE_NOT_SUPPORTED || error == ASR_LANGUAGE_UNAVAILABLE)
-                    && isUsingOnDevice) {
-                    Log.w(TAG, "On-device ASR zh-TW unsupported (err $error), retrying with default recognizer")
-                    onDeviceFailed = true
-                    isListening = true
-                    try { startSpeechRecognizer(); return } catch (e: Exception) {
-                        isListening = false
-                        Log.e(TAG, "Default recognizer fallback failed", e)
-                    }
                 }
                 resetUi()
                 toast(asrErrorMessage(error))
@@ -520,7 +522,13 @@ class VoiceInputMethodService : InputMethodService() {
     // ── Function keys ─────────────────────────────────────────────────────────
 
     private fun performBackspace() {
-        currentInputConnection?.deleteSurroundingText(1, 0)
+        val ic = currentInputConnection ?: return
+        // Delete the active selection if one exists; otherwise delete one char before cursor.
+        if (!ic.getSelectedText(0).isNullOrEmpty()) {
+            ic.commitText("", 1)
+        } else {
+            ic.deleteSurroundingText(1, 0)
+        }
         vibrate(10)
     }
 
@@ -558,7 +566,25 @@ class VoiceInputMethodService : InputMethodService() {
         micButton?.isEnabled = mode == UiMode.IDLE
     }
 
-    private fun resetUi() = setUiState(UiMode.IDLE)
+    private fun resetUi() {
+        setUiState(UiMode.IDLE)
+        updateBackendChip()
+    }
+
+    private fun updateBackendChip() {
+        val chip = backendChip ?: return
+        val s = gemmaManager.state
+        if (s !is EngineState.Ready) { chip.visibility = View.INVISIBLE; return }
+        val (label, textColor, bgColor) = when (s.backend) {
+            "NPU" -> Triple("⚡ NPU", Color.parseColor("#1B5E20"), Color.parseColor("#E8F5E9"))
+            "GPU" -> Triple("⚡ GPU", Color.parseColor("#0D47A1"), Color.parseColor("#E3F2FD"))
+            else  -> Triple("CPU",   Color.parseColor("#616161"), Color.parseColor("#EEEEEE"))
+        }
+        chip.text = label
+        chip.setTextColor(textColor)
+        (chip.background as? GradientDrawable)?.setColor(bgColor)
+        chip.visibility = View.VISIBLE
+    }
 
     private fun idleStatus(): String = when (val s = gemmaManager.state) {
         is EngineState.Ready -> getString(R.string.hold_to_speak)
