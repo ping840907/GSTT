@@ -10,11 +10,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -44,6 +39,7 @@ import com.example.voiceime.ai.ModelDownloadManager
 import com.example.voiceime.ai.ModelDownloadManager.DownloadState
 import com.example.voiceime.dictionary.DictionaryDao
 import com.example.voiceime.dictionary.DictionaryEntry
+import com.example.voiceime.preferences.ModalitySettings
 import dagger.hilt.android.AndroidEntryPoint
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
@@ -60,7 +56,8 @@ class DictionaryViewModel @Inject constructor(
     val dictionaryDao: DictionaryDao,
     val gemmaManager: GemmaInferenceManager,
     val modelDownload: ModelDownloadManager,
-    val deviceCapability: DeviceCapability
+    val deviceCapability: DeviceCapability,
+    private val modalitySettings: ModalitySettings
 ) : ViewModel() {
 
     val confirmedTerms: StateFlow<List<DictionaryEntry>> = dictionaryDao.observeConfirmed()
@@ -68,6 +65,22 @@ class DictionaryViewModel @Inject constructor(
 
     val candidateTerms: StateFlow<List<DictionaryEntry>> = dictionaryDao.observeCandidates()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    var useScreenText by mutableStateOf(modalitySettings.useScreenText)
+        private set
+
+    var useScreenshot by mutableStateOf(modalitySettings.useScreenshot)
+        private set
+
+    fun setUseScreenText(enabled: Boolean) {
+        useScreenText = enabled
+        modalitySettings.useScreenText = enabled
+    }
+
+    fun setUseScreenshot(enabled: Boolean) {
+        useScreenshot = enabled
+        modalitySettings.useScreenshot = enabled
+    }
 
     fun addTerm(term: String) = viewModelScope.launch {
         if (term.isBlank()) return@launch
@@ -192,6 +205,16 @@ private fun DictionaryScreen(
                     onRequestMicPermission = onRequestMicPermission,
                     onOpenImeSettings = onOpenImeSettings,
                     onOpenAccessibilitySettings = onOpenAccessibilitySettings
+                )
+            }
+
+            // ── Modality settings card ────────────────────────────────────────
+            item {
+                ModalitySettingsCard(
+                    useScreenText = viewModel.useScreenText,
+                    useScreenshot = viewModel.useScreenshot,
+                    onScreenTextChange = viewModel::setUseScreenText,
+                    onScreenshotChange = viewModel::setUseScreenshot
                 )
             }
 
@@ -434,6 +457,102 @@ private fun ModelDownloadCard(
                 }
             }
         }
+    }
+}
+
+// ── Modality settings card ────────────────────────────────────────────────────
+
+@Composable
+private fun ModalitySettingsCard(
+    useScreenText: Boolean,
+    useScreenshot: Boolean,
+    onScreenTextChange: (Boolean) -> Unit,
+    onScreenshotChange: (Boolean) -> Unit
+) {
+    val audioOnly = !useScreenText && !useScreenshot
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (audioOnly) Color(0xFFFFF3E0) else MaterialTheme.colorScheme.surfaceVariant
+        ),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(
+            Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.Tune,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "輔助模態設定",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp
+                )
+            }
+
+            Text(
+                if (audioOnly) "純語音模式：Gemma 僅依語音辨識結果推斷文字"
+                else "已啟用畫面輔助，Gemma 可參考畫面資訊修正辨識結果",
+                fontSize = 12.sp,
+                color = if (audioOnly) Color(0xFFE65100) else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+
+            ModalityToggleRow(
+                icon = Icons.Default.TextFields,
+                label = "畫面文字獲取",
+                description = "透過無障礙服務讀取當前畫面文字，用於修正諧音錯誤的專有名詞",
+                checked = useScreenText,
+                onCheckedChange = onScreenTextChange
+            )
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+            ModalityToggleRow(
+                icon = Icons.Default.Screenshot,
+                label = "畫面截圖獲取",
+                description = "擷取低解析度截圖，讓 Gemma 理解當前使用情境（需無障礙服務）",
+                checked = useScreenshot,
+                onCheckedChange = onScreenshotChange
+            )
+        }
+    }
+}
+
+@Composable
+private fun ModalityToggleRow(
+    icon: ImageVector,
+    label: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(vertical = 4.dp)
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = if (checked) MaterialTheme.colorScheme.primary else Color.Gray,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(label, fontSize = 14.sp, fontWeight = if (checked) FontWeight.Medium else FontWeight.Normal)
+            Text(description, fontSize = 11.sp, color = Color.Gray, lineHeight = 14.sp)
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            modifier = Modifier.padding(start = 8.dp)
+        )
     }
 }
 

@@ -44,7 +44,7 @@ class TranscriptionOrchestrator @Inject constructor(
         if (roughText.isBlank()) return@withContext TranscriptionResult("", emptyList())
 
         val dictTerms = dictionaryDao.getTopTerms(DICT_MAX_TERMS)
-        val prompt = buildPrompt(roughText, screenText.take(SCREEN_TEXT_MAX_CHARS), dictTerms)
+        val prompt = buildPrompt(roughText, screenText.take(SCREEN_TEXT_MAX_CHARS), dictTerms, screenshot != null)
 
         return@withContext try {
             val raw = gemma.transcribeOnce(
@@ -64,7 +64,8 @@ class TranscriptionOrchestrator @Inject constructor(
     private fun buildPrompt(
         roughText: String,
         screenText: String,
-        dictTerms: List<String>
+        dictTerms: List<String>,
+        hasScreenshot: Boolean
     ): String = buildString {
         append("初步語音辨識：「").append(roughText).append("」\n\n")
         if (screenText.isNotBlank()) {
@@ -73,7 +74,7 @@ class TranscriptionOrchestrator @Inject constructor(
         if (dictTerms.isNotEmpty()) {
             append("自訂詞彙（優先採用這些拼法）：").append(dictTerms.joinToString("、")).append("\n\n")
         }
-        if (screenText.isNotBlank()) {
+        if (hasScreenshot) {
             append("截圖已附上作為視覺情境參考。")
         }
     }

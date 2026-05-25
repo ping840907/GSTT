@@ -30,6 +30,7 @@ import com.example.voiceime.ai.EngineState
 import com.example.voiceime.ai.GemmaInferenceManager
 import com.example.voiceime.ai.TranscriptionOrchestrator
 import com.example.voiceime.dictionary.DictionaryDao
+import com.example.voiceime.preferences.ModalitySettings
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -49,6 +50,7 @@ class VoiceInputMethodService : InputMethodService() {
     @Inject lateinit var orchestrator: TranscriptionOrchestrator
     @Inject lateinit var deviceCapability: DeviceCapability
     @Inject lateinit var dictionaryDao: DictionaryDao
+    @Inject lateinit var modalitySettings: ModalitySettings
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
@@ -186,13 +188,15 @@ class VoiceInputMethodService : InputMethodService() {
     private fun captureContextAsync() = scope.launch {
         val accessibility = ScreenContextService.instance ?: return@launch
 
-        // Capture text immediately (fast); screenshot may take a few hundred ms
-        capturedScreenText = accessibility.getScreenText()
+        capturedScreenText = if (modalitySettings.useScreenText) {
+            accessibility.getScreenText()
+        } else ""
 
-        // Downscale to tier-appropriate size to respect device memory limits
-        val px = deviceCapability.screenshotSizePx
         capturedScreenshot?.recycle()
-        capturedScreenshot = accessibility.captureScreen(px, px)
+        capturedScreenshot = if (modalitySettings.useScreenshot) {
+            val px = deviceCapability.screenshotSizePx
+            accessibility.captureScreen(px, px)
+        } else null
     }
 
     // ── SpeechRecognizer ──────────────────────────────────────────────────────
