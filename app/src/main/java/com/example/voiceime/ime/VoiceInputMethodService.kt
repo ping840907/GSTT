@@ -91,6 +91,10 @@ class VoiceInputMethodService : InputMethodService() {
     private var progressBar: ProgressBar? = null
     private var pulseRing: View? = null
     private var backendChip: TextView? = null
+    private var audioPathChip: TextView? = null
+
+    private enum class AudioPath { NONE, GEMMA, ASR }
+    private var lastAudioPath = AudioPath.NONE
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -316,6 +320,19 @@ class VoiceInputMethodService : InputMethodService() {
             setOnClickListener { openDictionary() }
         }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         bar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))   // spacer
+        audioPathChip = TextView(this).apply {
+            textSize = 11f
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(10).toFloat()
+            }
+            visibility = View.INVISIBLE
+        }
+        bar.addView(audioPathChip, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.marginEnd = dp(6) })
         backendChip = TextView(this).apply {
             textSize = 11f
             setPadding(dp(8), dp(3), dp(8), dp(3))
@@ -544,6 +561,7 @@ class VoiceInputMethodService : InputMethodService() {
                     currentInputConnection?.commitText(result.text, 1)
                     lastCommittedText = result.text
                     vibrate(18)
+                    lastAudioPath = AudioPath.GEMMA
                     isProcessing = false
                     resetUi()
                     showCandidates(result.alternatives)
@@ -599,6 +617,7 @@ class VoiceInputMethodService : InputMethodService() {
                     currentInputConnection?.commitText(result.text, 1)
                     lastCommittedText = result.text
                     vibrate(18)
+                    lastAudioPath = AudioPath.ASR
                 }
                 isProcessing = false
                 resetUi()
@@ -657,6 +676,26 @@ class VoiceInputMethodService : InputMethodService() {
     private fun resetUi() {
         setUiState(UiMode.IDLE)
         updateBackendChip()
+        updateAudioPathChip()
+    }
+
+    private fun updateAudioPathChip() {
+        val chip = audioPathChip ?: return
+        when (lastAudioPath) {
+            AudioPath.NONE -> chip.visibility = View.INVISIBLE
+            AudioPath.GEMMA -> {
+                chip.text = "🤖 模型音訊"
+                chip.setTextColor(Color.parseColor("#1B5E20"))
+                (chip.background as? GradientDrawable)?.setColor(Color.parseColor("#E8F5E9"))
+                chip.visibility = View.VISIBLE
+            }
+            AudioPath.ASR -> {
+                chip.text = "📱 系統辨識"
+                chip.setTextColor(Color.parseColor("#E65100"))
+                (chip.background as? GradientDrawable)?.setColor(Color.parseColor("#FFF3E0"))
+                chip.visibility = View.VISIBLE
+            }
+        }
     }
 
     private fun updateBackendChip() {
