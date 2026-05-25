@@ -70,7 +70,16 @@ class ScreenContextService : AccessibilityService() {
                         executor,
                         object : TakeScreenshotCallback {
                             override fun onSuccess(screenshot: ScreenshotResult) {
-                                val hw = screenshot.bitmap
+                                val hardwareBuffer = screenshot.hardwareBuffer
+                                val hw = hardwareBuffer?.let {
+                                    Bitmap.wrapHardwareBuffer(it, screenshot.colorSpace)
+                                }
+                                hardwareBuffer?.close()
+                                if (hw == null) {
+                                    executor.shutdown()
+                                    cont.resume(null)
+                                    return
+                                }
                                 val soft = hw.copy(Bitmap.Config.ARGB_8888, false)
                                 hw.recycle()
                                 val scaled = Bitmap.createScaledBitmap(soft, targetWidth, targetHeight, true)
