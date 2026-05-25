@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">語音輸入鍵盤</string>
+    <string name="ime_name">語音輸入鍵盤 (Gemma)</string>
+    <string name="subtype_label">繁體中文語音</string>
+    <string name="subtype_label_en">English Voice</string>
+    <string name="accessibility_service_name">語音輸入輔助服務</string>
+    <string name="accessibility_service_description">用於擷取畫面文字與截圖，協助語音辨識校正。此服務不會上傳任何資料，所有處理均在本機完成。</string>
+    <string name="dictionary_activity_name">詞彙字典</string>
+
+    <string name="model_not_found">找不到 Gemma 模型。請依照說明將 model.litertlm 放置於應用程式目錄。</string>
+    <string name="model_loading">正在載入 Gemma 模型…</string>
+    <string name="model_ready">模型已就緒</string>
+    <string name="model_error">模型初始化失敗</string>
+
+    <string name="recording">錄音中，放開結束…</string>
+    <string name="processing">AI 處理中…</string>
+    <string name="tap_to_speak">點擊說話</string>
+    <string name="hold_to_speak">按住說話</string>
+    <string name="transcription_failed">語音辨識失敗，請再試一次</string>
+
+    <string name="accessibility_not_enabled">請先開啟無障礙服務</string>
+    <string name="mic_permission_required">需要麥克風權限才能使用語音輸入</string>
+
+    <string name="dictionary_title">自訂詞彙字典</string>
+    <string name="dictionary_hint">新增詞彙（例如：產品名稱、人名）</string>
+    <string name="add_term">新增</string>
+    <string name="delete_term">刪除</string>
+    <string name="dictionary_empty">字典目前為空，語音辨識後若出現新詞彙將自動建議加入</string>
+    <string name="term_added">詞彙已加入</string>
+    <string name="term_exists">詞彙已存在</string>
+    <string name="candidate_terms">建議新增的詞彙</string>
+    <string name="accept">接受</string>
+    <string name="reject">略過</string>
+
+    <string name="setup_title">設定語音輸入鍵盤</string>
+    <string name="setup_step_ime">1. 設定為預設輸入法</string>
+    <string name="setup_step_accessibility">2. 開啟無障礙服務</string>
+    <string name="setup_step_model">3. 安裝 Gemma 模型</string>
+    <string name="setup_step_permission">4. 授予麥克風權限</string>
+    <string name="open_settings">開啟設定</string>
+    <string name="model_setup_guide">將 model.litertlm 複製到：\nAndroid/data/com.example.voiceime/files/</string>
+    <string name="done">完成</string>
+    <string name="setup_done">所有設定已完成，可以開始使用！</string>
+</resources>
