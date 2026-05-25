@@ -17,6 +17,8 @@ import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -55,37 +57,44 @@ class GemmaInferenceManager @Inject constructor(
     private val context: Context,
     private val deviceCapability: DeviceCapability
 ) {
-    private var engine: Engine? = null
+    @Volatile private var engine: Engine? = null
     private var activeBackend: String = "CPU"
 
     @Volatile
     var state: EngineState = EngineState.Uninitialized
         private set
 
+    // Guards concurrent initialize() calls — prevents double engine creation.
+    private val initMutex = Mutex()
+
     // ── Initialisation ────────────────────────────────────────────────────────
 
     suspend fun initialize(): EngineState = withContext(Dispatchers.IO) {
         if (state is EngineState.Ready) return@withContext state
-        state = EngineState.Loading
-        Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
+        initMutex.withLock {
+            // Double-check after acquiring lock — a concurrent call may have finished first.
+            if (state is EngineState.Ready) return@withLock state
+            state = EngineState.Loading
+            Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
 
-        val modelPath = resolveModelPath() ?: run {
-            return@withContext EngineState.Error(
-                "找不到 $MODEL_FILENAME。請將模型複製到：\nAndroid/data/com.example.voiceime/files/"
-            ).also { state = it }
-        }
+            val modelPath = resolveModelPath() ?: run {
+                return@withContext EngineState.Error(
+                    "找不到 $MODEL_FILENAME。請將模型複製到：\nAndroid/data/com.example.voiceime/files/"
+                ).also { state = it }
+            }
 
-        val vendor = detectSocVendor()
-        val (eng, backendLabel) = tryCreateEngine(modelPath, vendor)
-        if (eng == null) {
-            return@withContext EngineState.Error("模型初始化失敗，請確認裝置記憶體是否充足。")
-                .also { state = it }
-        }
-        engine = eng
-        activeBackend = backendLabel
-        EngineState.Ready(backendLabel).also {
-            state = it
-            Log.i(TAG, "Gemma 4 E2B ready — backend=$backendLabel  model=$modelPath")
+            val vendor = detectSocVendor()
+            val (eng, backendLabel) = tryCreateEngine(modelPath, vendor)
+            if (eng == null) {
+                return@withContext EngineState.Error("模型初始化失敗，請確認裝置記憶體是否充足。")
+                    .also { state = it }
+            }
+            engine = eng
+            activeBackend = backendLabel
+            EngineState.Ready(backendLabel).also {
+                state = it
+                Log.i(TAG, "Gemma 4 E2B ready — backend=$backendLabel  model=$modelPath")
+            }
         }
     }
 

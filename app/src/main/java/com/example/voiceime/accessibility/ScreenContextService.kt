@@ -61,26 +61,34 @@ class ScreenContextService : AccessibilityService() {
         return try {
             suspendCancellableCoroutine { cont ->
                 val executor = Executors.newSingleThreadExecutor()
-                takeScreenshot(
-                    android.view.Display.DEFAULT_DISPLAY,
-                    executor,
-                    object : TakeScreenshotCallback {
-                        override fun onSuccess(screenshot: ScreenshotResult) {
-                            val hw = screenshot.hardwareBitmap
-                            val soft = hw.copy(Bitmap.Config.ARGB_8888, false)
-                            hw.recycle()
-                            val scaled = Bitmap.createScaledBitmap(soft, targetWidth, targetHeight, true)
-                            if (scaled !== soft) soft.recycle()
-                            executor.shutdown()
-                            cont.resume(scaled)
+                // Always shut down executor on cancellation — covers both explicit cancel
+                // and the case where takeScreenshot() throws synchronously before any callback fires.
+                cont.invokeOnCancellation { executor.shutdown() }
+                try {
+                    takeScreenshot(
+                        android.view.Display.DEFAULT_DISPLAY,
+                        executor,
+                        object : TakeScreenshotCallback {
+                            override fun onSuccess(screenshot: ScreenshotResult) {
+                                val hw = screenshot.hardwareBitmap
+                                val soft = hw.copy(Bitmap.Config.ARGB_8888, false)
+                                hw.recycle()
+                                val scaled = Bitmap.createScaledBitmap(soft, targetWidth, targetHeight, true)
+                                if (scaled !== soft) soft.recycle()
+                                executor.shutdown()
+                                cont.resume(scaled)
+                            }
+                            override fun onFailure(errorCode: Int) {
+                                Log.w(TAG, "takeScreenshot failed errorCode=$errorCode")
+                                executor.shutdown()
+                                cont.resume(null)
+                            }
                         }
-                        override fun onFailure(errorCode: Int) {
-                            Log.w(TAG, "takeScreenshot failed errorCode=$errorCode")
-                            executor.shutdown()
-                            cont.resume(null)
-                        }
-                    }
-                )
+                    )
+                } catch (e: Exception) {
+                    executor.shutdown()
+                    throw e
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "captureScreen exception", e)

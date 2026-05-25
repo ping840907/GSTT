@@ -17,6 +17,7 @@ import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.inputmethod.EditorInfo
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
@@ -34,8 +35,8 @@ import com.example.voiceime.preferences.ModalitySettings
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -60,6 +61,9 @@ class VoiceInputMethodService : InputMethodService() {
     private var capturedScreenText = ""
     private var capturedScreenshot: Bitmap? = null
     private var partialAsrText = ""
+
+    // Job for the concurrent screenshot/text capture so processWithGemma can join it.
+    private var captureJob: Job? = null
 
     private var isListening = false
     private var isProcessing = false
@@ -90,31 +94,34 @@ class VoiceInputMethodService : InputMethodService() {
     override fun onCreateInputView(): View = buildKeyboardView()
 
     private fun buildKeyboardView(): View {
+        val mp = LinearLayout.LayoutParams.MATCH_PARENT
+        val wc = LinearLayout.LayoutParams.WRAP_CONTENT
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#FAFAFA"))
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, dp(192)
-            )
+            setBackgroundColor(Color.parseColor("#F5F5F5"))
+            layoutParams = FrameLayout.LayoutParams(mp, dp(240))
         }
 
+        // ── Status label ──────────────────────────────────────────────────────
         statusLabel = TextView(this).apply {
             text = idleStatus()
-            textSize = 13f
+            textSize = 12.5f
             setTextColor(Color.DKGRAY)
             gravity = Gravity.CENTER
-            setPadding(0, dp(10), 0, 0)
+            setPadding(dp(8), dp(8), dp(8), 0)
         }
-        root.addView(statusLabel, lp(match = true, wrap = false))
+        root.addView(statusLabel, LinearLayout.LayoutParams(mp, wc))
 
+        // ── Progress bar ──────────────────────────────────────────────────────
         progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             isIndeterminate = true
             visibility = View.INVISIBLE
         }
-        root.addView(progressBar, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, dp(3)
-        ).also { it.setMargins(dp(40), dp(2), dp(40), 0) })
+        root.addView(progressBar, LinearLayout.LayoutParams(mp, dp(3))
+            .also { it.setMargins(dp(40), dp(2), dp(40), 0) })
 
+        // ── Mic frame (fills remaining space via weight) ───────────────────────
         val micFrame = FrameLayout(this)
 
         pulseRing = View(this).apply {
@@ -145,10 +152,23 @@ class VoiceInputMethodService : InputMethodService() {
         }
         micFrame.addView(micButton, FrameLayout.LayoutParams(dp(72), dp(72), Gravity.CENTER))
 
-        root.addView(micFrame, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-        ))
+        root.addView(micFrame, LinearLayout.LayoutParams(mp, 0, 1f))
 
+        // ── Function key row: [⌫ Backspace] ─── [↵ Enter] ────────────────────
+        val funcRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(4), dp(16), dp(4))
+        }
+        funcRow.addView(buildFuncKey("⌫", "刪除") { performBackspace() },
+            LinearLayout.LayoutParams(dp(80), dp(44)))
+        funcRow.addView(View(this),                               // spacer
+            LinearLayout.LayoutParams(0, 1, 1f))
+        funcRow.addView(buildFuncKey("↵", "換行/確認") { performEnter() },
+            LinearLayout.LayoutParams(dp(80), dp(44)))
+        root.addView(funcRow, LinearLayout.LayoutParams(mp, wc))
+
+        // ── Dictionary bar ────────────────────────────────────────────────────
         val bar = LinearLayout(this).apply {
             gravity = Gravity.CENTER
             setPadding(0, 0, 0, dp(8))
@@ -157,13 +177,28 @@ class VoiceInputMethodService : InputMethodService() {
             text = "📖 字典"
             textSize = 12f
             setTextColor(Color.parseColor("#1565C0"))
-            setPadding(dp(16), dp(8), dp(16), dp(8))
+            setPadding(dp(16), dp(6), dp(16), dp(6))
             setOnClickListener { openDictionary() }
         })
-        root.addView(bar, lp(match = true, wrap = false))
+        root.addView(bar, LinearLayout.LayoutParams(mp, wc))
 
         return root
     }
+
+    private fun buildFuncKey(label: String, contentDesc: String, onClick: () -> Unit): TextView =
+        TextView(this).apply {
+            text = label
+            contentDescription = contentDesc
+            textSize = 20f
+            gravity = Gravity.CENTER
+            setTextColor(BLUE)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(10).toFloat()
+                setColor(Color.parseColor("#E3EBF8"))
+            }
+            setOnClickListener { onClick() }
+        }
 
     // ── Mic press / release ───────────────────────────────────────────────────
 
@@ -173,30 +208,38 @@ class VoiceInputMethodService : InputMethodService() {
         vibrate(25)
         setUiState(UiMode.RECORDING)
         captureContextAsync()
-        startSpeechRecognizer()
+        try {
+            startSpeechRecognizer()
+        } catch (e: Exception) {
+            Log.e(TAG, "SpeechRecognizer start failed", e)
+            isListening = false
+            setUiState(UiMode.IDLE)
+            toast("語音服務啟動失敗，請重試")
+        }
     }
 
     private fun onMicUp() {
         if (!isListening) return
         isListening = false
         speechRecognizer?.stopListening()
-        // onResults will drive the next step; setUiState to PROCESSING done there.
     }
 
     // ── Context capture (concurrent with recording) ───────────────────────────
 
-    private fun captureContextAsync() = scope.launch {
-        val accessibility = ScreenContextService.instance ?: return@launch
+    private fun captureContextAsync() {
+        captureJob?.cancel()
+        captureJob = scope.launch {
+            val accessibility = ScreenContextService.instance ?: return@launch
 
-        capturedScreenText = if (modalitySettings.useScreenText) {
-            accessibility.getScreenText()
-        } else ""
+            capturedScreenText = if (modalitySettings.useScreenText) {
+                accessibility.getScreenText()
+            } else ""
 
-        capturedScreenshot?.recycle()
-        capturedScreenshot = if (modalitySettings.useScreenshot) {
-            val px = deviceCapability.screenshotSizePx
-            accessibility.captureScreen(px, px)
-        } else null
+            capturedScreenshot?.recycle()
+            capturedScreenshot = if (modalitySettings.useScreenshot) {
+                accessibility.captureScreen(deviceCapability.screenshotSizePx, deviceCapability.screenshotSizePx)
+            } else null
+        }
     }
 
     // ── SpeechRecognizer ──────────────────────────────────────────────────────
@@ -261,7 +304,11 @@ class VoiceInputMethodService : InputMethodService() {
 
             override fun onError(error: Int) {
                 isListening = false
-                // If we have partial results, use them rather than giving up
+                // Destroy the recognizer on error — a stale instance may not recover
+                // reliably for the next startListening() call.
+                speechRecognizer?.destroy()
+                speechRecognizer = null
+
                 val rough = partialAsrText.trim()
                 if (rough.isNotBlank()) {
                     Log.w(TAG, "ASR error $error — using partial result: \"$rough\"")
@@ -283,14 +330,18 @@ class VoiceInputMethodService : InputMethodService() {
         isProcessing = true
         setUiState(UiMode.PROCESSING)
 
-        val screenText = capturedScreenText
-        val screenshot = capturedScreenshot
-        capturedScreenshot = null   // ownership transferred to orchestrator
-        capturedScreenText = ""
-
         scope.launch {
+            // Wait for the concurrent screenshot capture to finish before reading.
+            // join() is a no-op if the job already completed or was never started.
+            captureJob?.join()
+
+            val screenText = capturedScreenText
+            val screenshot = capturedScreenshot
+            capturedScreenshot = null   // ownership transferred to orchestrator
+            capturedScreenText = ""
+
             val result = orchestrator.transcribe(roughText, screenText, screenshot)
-            // screenshot recycled inside orchestrator
+            // screenshot recycled inside orchestrator.finally{}
 
             withContext(Dispatchers.Main) {
                 if (result.text.isNotBlank()) {
@@ -301,6 +352,24 @@ class VoiceInputMethodService : InputMethodService() {
                 resetUi()
             }
         }
+    }
+
+    // ── Function keys ─────────────────────────────────────────────────────────
+
+    private fun performBackspace() {
+        currentInputConnection?.deleteSurroundingText(1, 0)
+        vibrate(10)
+    }
+
+    private fun performEnter() {
+        val ic = currentInputConnection ?: return
+        val action = (currentInputEditorInfo?.imeOptions ?: 0) and EditorInfo.IME_MASK_ACTION
+        if (action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
+            ic.performEditorAction(action)
+        } else {
+            ic.commitText("\n", 1)
+        }
+        vibrate(10)
     }
 
     // ── UI helpers ────────────────────────────────────────────────────────────
@@ -356,10 +425,6 @@ class VoiceInputMethodService : InputMethodService() {
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density + 0.5f).toInt()
-    private fun lp(match: Boolean, wrap: Boolean) = LinearLayout.LayoutParams(
-        if (match) LinearLayout.LayoutParams.MATCH_PARENT else LinearLayout.LayoutParams.WRAP_CONTENT,
-        if (wrap) LinearLayout.LayoutParams.WRAP_CONTENT else LinearLayout.LayoutParams.WRAP_CONTENT
-    )
 
     companion object {
         private val BLUE = Color.parseColor("#1565C0")

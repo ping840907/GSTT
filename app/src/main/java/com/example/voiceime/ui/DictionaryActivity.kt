@@ -28,7 +28,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewModelScope
 import com.example.voiceime.R
 import com.example.voiceime.accessibility.ScreenContextService
@@ -152,10 +155,15 @@ private fun DictionaryScreen(
     val imeEnabled = remember { mutableStateOf(false) }
     val accessibilityEnabled = remember { mutableStateOf(false) }
 
-    LaunchedEffect(Unit) {
-        val imm = context.getSystemService(InputMethodManager::class.java)
-        imeEnabled.value = imm.enabledInputMethodList.any { it.packageName == context.packageName }
-        accessibilityEnabled.value = ScreenContextService.isConnected()
+    // Re-check on every onResume so returning from system settings immediately
+    // reflects the updated IME / accessibility state in the setup checklist.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            val imm = context.getSystemService(InputMethodManager::class.java)
+            imeEnabled.value = imm.enabledInputMethodList.any { it.packageName == context.packageName }
+            accessibilityEnabled.value = ScreenContextService.isConnected()
+        }
     }
 
     // Trigger model init once download succeeds

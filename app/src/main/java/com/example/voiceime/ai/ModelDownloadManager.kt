@@ -51,7 +51,11 @@ class ModelDownloadManager @Inject constructor(
     private var downloadJob: Job? = null
 
     fun startDownload() {
+        // Both the guard check and the initial state write must happen synchronously
+        // (before the coroutine launches) so rapid double-taps cannot both pass the
+        // check while the state is still Idle.
         if (_state.value is DownloadState.Downloading) return
+        _state.value = DownloadState.Downloading(0f, 0L, 0L)
         downloadJob?.cancel()
         downloadJob = scope.launch {
             val destDir = context.getExternalFilesDir(null) ?: context.filesDir
@@ -59,8 +63,6 @@ class ModelDownloadManager @Inject constructor(
             val finalFile = File(destDir, MODEL_FILENAME)
 
             try {
-                _state.value = DownloadState.Downloading(0f, 0L, 0L)
-
                 val conn = URL(MODEL_URL).openConnection() as HttpURLConnection
                 conn.connectTimeout = 30_000
                 conn.readTimeout = 60_000
