@@ -38,6 +38,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
@@ -65,6 +66,9 @@ class VoiceInputMethodService : InputMethodService() {
     // Job for the concurrent screenshot/text capture so processWithGemma can join it.
     private var captureJob: Job? = null
 
+    // Repeating-delete job while backspace is held down.
+    private var backspaceJob: Job? = null
+
     private var isListening = false
     private var isProcessing = false
 
@@ -81,6 +85,8 @@ class VoiceInputMethodService : InputMethodService() {
     }
 
     override fun onDestroy() {
+        backspaceJob?.cancel()
+        backspaceJob = null
         speechRecognizer?.destroy()
         speechRecognizer = null
         capturedScreenshot?.recycle()
@@ -160,8 +166,33 @@ class VoiceInputMethodService : InputMethodService() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(4), dp(16), dp(4))
         }
-        funcRow.addView(buildFuncKey("⌫", "刪除") { performBackspace() },
-            LinearLayout.LayoutParams(dp(80), dp(44)))
+
+        val backspaceBtn = buildFuncKey("⌫", "刪除", onClick = null)
+        backspaceBtn.setOnTouchListener { v, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    v.isPressed = true
+                    backspaceJob?.cancel()
+                    backspaceJob = scope.launch {
+                        performBackspace()                  // immediate first delete
+                        delay(400L)                         // initial long-press threshold
+                        while (true) {
+                            performBackspace()
+                            delay(50L)                      // repeat every 50 ms while held
+                        }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    v.isPressed = false
+                    backspaceJob?.cancel()
+                    backspaceJob = null
+                    true
+                }
+                else -> false
+            }
+        }
+        funcRow.addView(backspaceBtn, LinearLayout.LayoutParams(dp(80), dp(44)))
         funcRow.addView(View(this),                               // spacer
             LinearLayout.LayoutParams(0, 1, 1f))
         funcRow.addView(buildFuncKey("↵", "換行/確認") { performEnter() },
@@ -185,7 +216,7 @@ class VoiceInputMethodService : InputMethodService() {
         return root
     }
 
-    private fun buildFuncKey(label: String, contentDesc: String, onClick: () -> Unit): TextView =
+    private fun buildFuncKey(label: String, contentDesc: String, onClick: (() -> Unit)?): TextView =
         TextView(this).apply {
             text = label
             contentDescription = contentDesc
@@ -197,7 +228,7 @@ class VoiceInputMethodService : InputMethodService() {
                 cornerRadius = dp(10).toFloat()
                 setColor(Color.parseColor("#E3EBF8"))
             }
-            setOnClickListener { onClick() }
+            if (onClick != null) setOnClickListener { onClick() }
         }
 
     // ── Mic press / release ───────────────────────────────────────────────────
