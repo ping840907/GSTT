@@ -136,6 +136,7 @@ class DictionaryActivity : ComponentActivity() {
 
 // ── Root screen ────────────────────────────────────────────────────────────────
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DictionaryScreen(
     viewModel: DictionaryViewModel,

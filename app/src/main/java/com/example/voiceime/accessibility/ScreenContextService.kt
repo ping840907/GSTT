@@ -57,7 +57,7 @@ class ScreenContextService : AccessibilityService() {
         targetWidth: Int = SCREENSHOT_SIZE_DEFAULT,
         targetHeight: Int = SCREENSHOT_SIZE_DEFAULT
     ): Bitmap? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return null
         return try {
             suspendCancellableCoroutine { cont ->
                 val executor = Executors.newSingleThreadExecutor()
@@ -70,7 +70,7 @@ class ScreenContextService : AccessibilityService() {
                         executor,
                         object : TakeScreenshotCallback {
                             override fun onSuccess(screenshot: ScreenshotResult) {
-                                val hw = screenshot.hardwareBitmap
+                                val hw = screenshot.bitmap
                                 val soft = hw.copy(Bitmap.Config.ARGB_8888, false)
                                 hw.recycle()
                                 val scaled = Bitmap.createScaledBitmap(soft, targetWidth, targetHeight, true)

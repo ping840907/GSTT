@@ -452,7 +452,7 @@ class VoiceInputMethodService : InputMethodService() {
                 }
                 resetUi()
                 toast(asrErrorMessage(error))
-                if (error == SpeechRecognizer.ERROR_NOT_SUPPORTED) {
+                if (error == ASR_LANGUAGE_NOT_SUPPORTED || error == ASR_LANGUAGE_UNAVAILABLE) {
                     openSpeechLanguageSettings()
                 }
                 Log.w(TAG, "ASR error: $error")
@@ -585,7 +585,7 @@ class VoiceInputMethodService : InputMethodService() {
         SpeechRecognizer.ERROR_NO_MATCH -> "未辨識到語音，請再說一次"
         SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "語音輸入逾時"
         SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "辨識器忙碌，請稍後再試"
-        SpeechRecognizer.ERROR_NOT_SUPPORTED -> "請安裝繁體中文離線語言包（正在開啟設定…）"
+        ASR_LANGUAGE_NOT_SUPPORTED, ASR_LANGUAGE_UNAVAILABLE -> "請安裝繁體中文離線語言包（正在開啟設定…）"
         else -> "語音辨識錯誤（$code）"
     }
 
@@ -593,5 +593,8 @@ class VoiceInputMethodService : InputMethodService() {
 
     companion object {
         private val BLUE = Color.parseColor("#1565C0")
+        // SpeechRecognizer constants absent from older SDK stubs
+        private const val ASR_LANGUAGE_NOT_SUPPORTED = 11
+        private const val ASR_LANGUAGE_UNAVAILABLE = 12
     }
 }
