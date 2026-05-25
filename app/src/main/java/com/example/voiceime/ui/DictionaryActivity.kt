@@ -10,6 +10,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -22,6 +27,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -31,12 +37,16 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.voiceime.R
 import com.example.voiceime.accessibility.ScreenContextService
+import com.example.voiceime.ai.DeviceCapability
 import com.example.voiceime.ai.EngineState
 import com.example.voiceime.ai.GemmaInferenceManager
+import com.example.voiceime.ai.ModelDownloadManager
+import com.example.voiceime.ai.ModelDownloadManager.DownloadState
 import com.example.voiceime.dictionary.DictionaryDao
 import com.example.voiceime.dictionary.DictionaryEntry
 import dagger.hilt.android.AndroidEntryPoint
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
@@ -48,7 +58,9 @@ import javax.inject.Inject
 @HiltViewModel
 class DictionaryViewModel @Inject constructor(
     val dictionaryDao: DictionaryDao,
-    val gemmaManager: GemmaInferenceManager
+    val gemmaManager: GemmaInferenceManager,
+    val modelDownload: ModelDownloadManager,
+    val deviceCapability: DeviceCapability
 ) : ViewModel() {
 
     val confirmedTerms: StateFlow<List<DictionaryEntry>> = dictionaryDao.observeConfirmed()
@@ -73,6 +85,11 @@ class DictionaryViewModel @Inject constructor(
     fun rejectCandidate(entry: DictionaryEntry) = viewModelScope.launch {
         dictionaryDao.delete(entry)
     }
+
+    /** Trigger model init after a successful download. */
+    fun initModelAfterDownload() = viewModelScope.launch(Dispatchers.IO) {
+        gemmaManager.initialize()
+    }
 }
 
 // ── Activity ──────────────────────────────────────────────────────────────────
@@ -84,32 +101,24 @@ class DictionaryActivity : ComponentActivity() {
 
     private val requestMicPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* UI will re-read permission state via LaunchedEffect */ }
+    ) { /* UI re-reads permission state via LaunchedEffect */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MaterialTheme {
+            MaterialTheme(colorScheme = lightColorScheme()) {
                 DictionaryScreen(
                     viewModel = viewModel,
                     onRequestMicPermission = { requestMicPermission.launch(Manifest.permission.RECORD_AUDIO) },
-                    onOpenImeSettings = { openImeSettings() },
-                    onOpenAccessibilitySettings = { openAccessibilitySettings() }
+                    onOpenImeSettings = { startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)) },
+                    onOpenAccessibilitySettings = { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
                 )
             }
         }
     }
-
-    private fun openImeSettings() {
-        startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
-    }
-
-    private fun openAccessibilitySettings() {
-        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-    }
 }
 
-// ── Screen ────────────────────────────────────────────────────────────────────
+// ── Root screen ────────────────────────────────────────────────────────────────
 
 @Composable
 private fun DictionaryScreen(
@@ -121,34 +130,32 @@ private fun DictionaryScreen(
     val context = LocalContext.current
     val confirmedTerms by viewModel.confirmedTerms.collectAsState()
     val candidateTerms by viewModel.candidateTerms.collectAsState()
+    val downloadState by viewModel.modelDownload.state.collectAsState()
     var newTermInput by remember { mutableStateOf("") }
 
-    // Live permission / service status
-    val hasMic by remember {
-        derivedStateOf {
-            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                    PackageManager.PERMISSION_GRANTED
-        }
-    }
+    val hasMic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+
     val imeEnabled = remember { mutableStateOf(false) }
     val accessibilityEnabled = remember { mutableStateOf(false) }
-    val modelInstalled = remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         val imm = context.getSystemService(InputMethodManager::class.java)
-        imeEnabled.value = imm.enabledInputMethodList.any {
-            it.packageName == context.packageName
-        }
+        imeEnabled.value = imm.enabledInputMethodList.any { it.packageName == context.packageName }
         accessibilityEnabled.value = ScreenContextService.isConnected()
-        modelInstalled.value = viewModel.gemmaManager.isModelInstalled()
+    }
+
+    // Trigger model init once download succeeds
+    LaunchedEffect(downloadState) {
+        if (downloadState is DownloadState.Done) viewModel.initModelAfterDownload()
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("語音輸入鍵盤") },
+                title = { Text("語音輸入鍵盤", fontWeight = FontWeight.SemiBold) },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = Color(0xFF1976D2),
+                    containerColor = Color(0xFF1565C0),
                     titleContentColor = Color.White
                 )
             )
@@ -163,72 +170,40 @@ private fun DictionaryScreen(
             contentPadding = PaddingValues(vertical = 16.dp)
         ) {
 
-            // ── Setup status ──────────────────────────────────────────────────
+            // ── Model download card ───────────────────────────────────────────
             item {
-                SetupCard(
+                ModelDownloadCard(
+                    downloadState = downloadState,
+                    isInstalled = viewModel.gemmaManager.isModelInstalled()
+                            || downloadState is DownloadState.Done,
+                    engineState = viewModel.gemmaManager.state,
+                    ramTier = viewModel.deviceCapability.tier,
+                    onDownload = { viewModel.modelDownload.startDownload() },
+                    onCancel = { viewModel.modelDownload.cancelDownload() }
+                )
+            }
+
+            // ── Setup checklist ───────────────────────────────────────────────
+            item {
+                SetupChecklistCard(
                     hasMic = hasMic,
                     imeEnabled = imeEnabled.value,
                     accessibilityEnabled = accessibilityEnabled.value,
-                    modelInstalled = modelInstalled.value,
                     onRequestMicPermission = onRequestMicPermission,
                     onOpenImeSettings = onOpenImeSettings,
                     onOpenAccessibilitySettings = onOpenAccessibilitySettings
                 )
             }
 
-            // ── Model status ──────────────────────────────────────────────────
+            // ── Dictionary section ────────────────────────────────────────────
             item {
-                val state = viewModel.gemmaManager.state
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = when (state) {
-                                    is EngineState.Ready -> Icons.Default.CheckCircle
-                                    is EngineState.Error -> Icons.Default.Error
-                                    else -> Icons.Default.HourglassEmpty
-                                },
-                                contentDescription = null,
-                                tint = when (state) {
-                                    is EngineState.Ready -> Color(0xFF4CAF50)
-                                    is EngineState.Error -> Color(0xFFE53935)
-                                    else -> Color(0xFFFFA000)
-                                }
-                            )
-                            Spacer(Modifier.width(12.dp))
-                            Column {
-                                Text("Gemma 4 E2B（LiteRT-LM）", fontWeight = FontWeight.Medium)
-                                Text(
-                                    when (state) {
-                                        is EngineState.Ready -> "已就緒（${state.backend}）"
-                                        is EngineState.Error -> state.message
-                                        is EngineState.Loading -> "載入中…"
-                                        else -> "未初始化（首次使用鍵盤時自動載入）"
-                                    },
-                                    fontSize = 12.sp,
-                                    color = Color.Gray
-                                )
-                            }
-                        }
-                        if (state is EngineState.Ready) {
-                            Text(
-                                "音訊：Android 離線 ASR → 粗轉錄 → Gemma 4 校正\n" +
-                                "影像：畫面截圖 → Content.ImageBytes（Issue #1874 已修復）\n" +
-                                "文字：無障礙服務擷取畫面上下文",
-                                fontSize = 11.sp,
-                                color = Color.Gray,
-                                lineHeight = 16.sp,
-                                modifier = Modifier.padding(start = 4.dp)
-                            )
-                        }
-                    }
-                }
+                Text(
+                    "自訂詞彙字典",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
             }
 
-            // ── Add new term ──────────────────────────────────────────────────
-            item {
-                Text("自訂詞彙字典", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            }
             item {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(
@@ -236,7 +211,8 @@ private fun DictionaryScreen(
                         onValueChange = { newTermInput = it },
                         label = { Text(context.getString(R.string.dictionary_hint)) },
                         modifier = Modifier.weight(1f),
-                        singleLine = true
+                        singleLine = true,
+                        shape = RoundedCornerShape(12.dp)
                     )
                     Spacer(Modifier.width(8.dp))
                     Button(
@@ -245,19 +221,19 @@ private fun DictionaryScreen(
                                 viewModel.addTerm(newTermInput)
                                 newTermInput = ""
                             }
-                        }
+                        },
+                        shape = RoundedCornerShape(12.dp)
                     ) { Text("新增") }
                 }
             }
 
-            // ── Confirmed terms list ──────────────────────────────────────────
-            if (confirmedTerms.isEmpty()) {
+            if (confirmedTerms.isEmpty() && candidateTerms.isEmpty()) {
                 item {
                     Text(
                         context.getString(R.string.dictionary_empty),
                         color = Color.Gray,
                         fontSize = 13.sp,
-                        modifier = Modifier.padding(vertical = 8.dp)
+                        modifier = Modifier.padding(vertical = 4.dp)
                     )
                 }
             } else {
@@ -268,25 +244,26 @@ private fun DictionaryScreen(
                         onDelete = { viewModel.deleteTerm(entry) }
                     )
                 }
-            }
 
-            // ── Candidate terms (AI-suggested) ────────────────────────────────
-            if (candidateTerms.isNotEmpty()) {
-                item {
-                    HorizontalDivider()
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "AI 辨識到的新詞彙（建議加入）",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = Color(0xFF1976D2)
-                    )
-                }
-                items(candidateTerms, key = { it.id }) { entry ->
-                    CandidateRow(
-                        term = entry.term,
-                        onAccept = { viewModel.acceptCandidate(entry) },
-                        onReject = { viewModel.rejectCandidate(entry) }
-                    )
+                if (candidateTerms.isNotEmpty()) {
+                    item {
+                        Spacer(Modifier.height(4.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "AI 辨識到的新詞彙（建議加入）",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = Color(0xFF1565C0)
+                        )
+                        Spacer(Modifier.height(4.dp))
+                    }
+                    items(candidateTerms, key = { it.id }) { entry ->
+                        CandidateRow(
+                            term = entry.term,
+                            onAccept = { viewModel.acceptCandidate(entry) },
+                            onReject = { viewModel.rejectCandidate(entry) }
+                        )
+                    }
                 }
             }
 
@@ -295,94 +272,264 @@ private fun DictionaryScreen(
     }
 }
 
+// ── Model download card ────────────────────────────────────────────────────────
+
 @Composable
-private fun SetupCard(
-    hasMic: Boolean,
-    imeEnabled: Boolean,
-    accessibilityEnabled: Boolean,
-    modelInstalled: Boolean,
-    onRequestMicPermission: () -> Unit,
-    onOpenImeSettings: () -> Unit,
-    onOpenAccessibilitySettings: () -> Unit
+private fun ModelDownloadCard(
+    downloadState: DownloadState,
+    isInstalled: Boolean,
+    engineState: EngineState,
+    ramTier: Int,
+    onDownload: () -> Unit,
+    onCancel: () -> Unit
 ) {
-    val allDone = hasMic && imeEnabled && accessibilityEnabled && modelInstalled
+    val isDownloading = downloadState is DownloadState.Downloading
+    val isFailed = downloadState is DownloadState.Failed
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = if (allDone) Color(0xFFE8F5E9) else Color(0xFFFFF8E1)
-        )
+            containerColor = when {
+                isInstalled -> Color(0xFFE8F5E9)
+                isFailed -> Color(0xFFFFEBEE)
+                else -> MaterialTheme.colorScheme.surfaceVariant
+            }
+        ),
+        shape = RoundedCornerShape(16.dp)
     ) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("設定檢查", fontWeight = FontWeight.Bold)
+        Column(
+            modifier = Modifier.padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // Header
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = when {
+                        isInstalled -> Icons.Default.CheckCircle
+                        isFailed -> Icons.Default.Error
+                        isDownloading -> Icons.Default.Downloading
+                        else -> Icons.Default.Memory
+                    },
+                    contentDescription = null,
+                    tint = when {
+                        isInstalled -> Color(0xFF2E7D32)
+                        isFailed -> Color(0xFFC62828)
+                        isDownloading -> Color(0xFF1565C0)
+                        else -> MaterialTheme.colorScheme.primary
+                    },
+                    modifier = Modifier.size(28.dp)
+                )
+                Spacer(Modifier.width(12.dp))
+                Column {
+                    Text(
+                        "Gemma 4 E2B（LiteRT-LM）",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        "Google 開源模型 · 約 ${ModelDownloadManager.MODEL_SIZE_GB} GB",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
 
-            SetupRow(
-                done = hasMic,
-                label = "麥克風權限",
-                actionLabel = if (!hasMic) "授予" else null,
-                onAction = onRequestMicPermission
-            )
-            SetupRow(
-                done = imeEnabled,
-                label = "已設為輸入法",
-                actionLabel = if (!imeEnabled) "開啟設定" else null,
-                onAction = onOpenImeSettings
-            )
-            SetupRow(
-                done = accessibilityEnabled,
-                label = "無障礙服務已啟用",
-                actionLabel = if (!accessibilityEnabled) "開啟設定" else null,
-                onAction = onOpenAccessibilitySettings
-            )
-            SetupRow(
-                done = modelInstalled,
-                label = "Gemma 模型已安裝",
-                actionLabel = null,
-                onAction = {}
-            )
-            if (!modelInstalled) {
+            // Download progress
+            if (isDownloading) {
+                val dl = downloadState as DownloadState.Downloading
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            "${dl.downloadedMb} / ${if (dl.totalMb > 0) "${dl.totalMb} MB" else "計算中…"}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            "${(dl.progress * 100).toInt()}%",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                    LinearProgressIndicator(
+                        progress = { dl.progress },
+                        modifier = Modifier.fillMaxWidth(),
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                }
+            }
+
+            // Installed: show engine state
+            if (isInstalled) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = when (engineState) {
+                            is EngineState.Ready -> Icons.Default.Done
+                            is EngineState.Loading -> Icons.Default.HourglassEmpty
+                            is EngineState.Error -> Icons.Default.Warning
+                            else -> Icons.Default.HourglassEmpty
+                        },
+                        contentDescription = null,
+                        tint = Color(0xFF2E7D32),
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        when (engineState) {
+                            is EngineState.Ready -> "模型已就緒（${engineState.backend}）"
+                            is EngineState.Loading -> "模型載入中…"
+                            is EngineState.Error -> "載入失敗：${engineState.message}"
+                            else -> "模型已安裝，首次使用鍵盤時自動載入"
+                        },
+                        fontSize = 12.sp,
+                        color = Color(0xFF2E7D32)
+                    )
+                }
+
+                // RAM tier indicator
                 Text(
-                    "請將 model.litertlm 複製到：\nAndroid/data/com.example.voiceime/files/",
+                    "裝置等級 Tier $ramTier（截圖解析度 ${intArrayOf(224, 336, 448)[ramTier]}px）",
                     fontSize = 11.sp,
                     color = Color.Gray
                 )
+            }
+
+            // Failed: show error
+            if (isFailed) {
+                Text(
+                    "⚠ ${(downloadState as DownloadState.Failed).error}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFC62828)
+                )
+            }
+
+            // Action buttons
+            if (!isInstalled) {
+                Button(
+                    onClick = if (isDownloading) onCancel else onDownload,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = if (isDownloading)
+                        ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828))
+                    else
+                        ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0))
+                ) {
+                    Icon(
+                        imageVector = if (isDownloading) Icons.Default.Cancel else Icons.Default.Download,
+                        contentDescription = null
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        when {
+                            isDownloading -> "取消下載"
+                            isFailed -> "重新下載"
+                            else -> "一鍵下載 Gemma 4 模型（約 2 GB）"
+                        },
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                }
             }
         }
     }
 }
 
+// ── Setup checklist card ──────────────────────────────────────────────────────
+
 @Composable
-private fun SetupRow(done: Boolean, label: String, actionLabel: String?, onAction: () -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Icon(
-            imageVector = if (done) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-            contentDescription = null,
-            tint = if (done) Color(0xFF4CAF50) else Color(0xFFFFA000),
-            modifier = Modifier.size(20.dp)
-        )
-        Spacer(Modifier.width(8.dp))
-        Text(label, modifier = Modifier.weight(1f), fontSize = 14.sp)
-        if (!done && actionLabel != null) {
-            TextButton(onClick = onAction) { Text(actionLabel, fontSize = 12.sp) }
+private fun SetupChecklistCard(
+    hasMic: Boolean,
+    imeEnabled: Boolean,
+    accessibilityEnabled: Boolean,
+    onRequestMicPermission: () -> Unit,
+    onOpenImeSettings: () -> Unit,
+    onOpenAccessibilitySettings: () -> Unit
+) {
+    val allDone = hasMic && imeEnabled && accessibilityEnabled
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (allDone) Color(0xFFE8F5E9) else Color(0xFFFFF8E1)
+        ),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(
+            Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                if (allDone) "✅ 設定完成，可以開始使用！" else "設定步驟",
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp
+            )
+            SetupRow(
+                done = hasMic, icon = Icons.Default.Mic,
+                label = "麥克風權限",
+                actionLabel = if (!hasMic) "授予" else null,
+                onAction = onRequestMicPermission
+            )
+            SetupRow(
+                done = imeEnabled, icon = Icons.Default.Keyboard,
+                label = "設為預設輸入法",
+                actionLabel = if (!imeEnabled) "開啟設定" else null,
+                onAction = onOpenImeSettings
+            )
+            SetupRow(
+                done = accessibilityEnabled, icon = Icons.Default.Accessibility,
+                label = "無障礙服務已啟用",
+                actionLabel = if (!accessibilityEnabled) "開啟設定" else null,
+                onAction = onOpenAccessibilitySettings
+            )
         }
     }
 }
+
+@Composable
+private fun SetupRow(
+    done: Boolean,
+    icon: ImageVector,
+    label: String,
+    actionLabel: String?,
+    onAction: () -> Unit
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(
+            imageVector = if (done) Icons.Default.CheckCircle else icon,
+            contentDescription = null,
+            tint = if (done) Color(0xFF2E7D32) else Color(0xFFFFA000),
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(Modifier.width(10.dp))
+        Text(label, modifier = Modifier.weight(1f), fontSize = 14.sp)
+        if (!done && actionLabel != null) {
+            TextButton(onClick = onAction) {
+                Text(actionLabel, fontSize = 12.sp, color = Color(0xFF1565C0))
+            }
+        }
+    }
+}
+
+// ── Dictionary rows ───────────────────────────────────────────────────────────
 
 @Composable
 private fun TermRow(term: String, usageCount: Int, onDelete: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Color.White, RoundedCornerShape(8.dp))
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .background(Color.White, RoundedCornerShape(10.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(term, modifier = Modifier.weight(1f), fontSize = 15.sp)
         if (usageCount > 0) {
             Text("×$usageCount", fontSize = 11.sp, color = Color.Gray)
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(6.dp))
         }
         IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
-            Icon(Icons.Default.Delete, contentDescription = "刪除", tint = Color(0xFFE53935))
+            Icon(Icons.Default.Delete, contentDescription = "刪除", tint = Color(0xFFE53935), modifier = Modifier.size(20.dp))
         }
     }
 }
@@ -392,15 +539,17 @@ private fun CandidateRow(term: String, onAccept: () -> Unit, onReject: () -> Uni
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Color(0xFFF3F8FF), RoundedCornerShape(8.dp))
-            .padding(horizontal = 12.dp, vertical = 6.dp),
+            .background(Color(0xFFF3F8FF), RoundedCornerShape(10.dp))
+            .padding(horizontal = 14.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Icon(Icons.Default.AutoAwesome, contentDescription = null,
-            tint = Color(0xFF1976D2), modifier = Modifier.size(16.dp))
+        Icon(
+            Icons.Default.AutoAwesome, contentDescription = null,
+            tint = Color(0xFF1565C0), modifier = Modifier.size(16.dp)
+        )
         Spacer(Modifier.width(8.dp))
         Text(term, modifier = Modifier.weight(1f), fontSize = 15.sp)
-        TextButton(onClick = onAccept) { Text("加入", color = Color(0xFF1976D2)) }
-        TextButton(onClick = onReject) { Text("略過", color = Color.Gray) }
+        TextButton(onClick = onAccept) { Text("加入", color = Color(0xFF1565C0), fontSize = 13.sp) }
+        TextButton(onClick = onReject) { Text("略過", color = Color.Gray, fontSize = 13.sp) }
     }
 }

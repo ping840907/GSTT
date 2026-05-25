@@ -3,6 +3,7 @@ package com.example.voiceime.di
 import android.content.Context
 import com.example.voiceime.ai.DeviceCapability
 import com.example.voiceime.ai.GemmaInferenceManager
+import com.example.voiceime.ai.ModelDownloadManager
 import com.example.voiceime.dictionary.DictionaryDao
 import com.example.voiceime.dictionary.DictionaryDatabase
 import dagger.Module
@@ -32,4 +33,8 @@ object AppModule {
         @ApplicationContext ctx: Context,
         deviceCapability: DeviceCapability
     ): GemmaInferenceManager = GemmaInferenceManager(ctx, deviceCapability)
+
+    @Provides @Singleton
+    fun provideModelDownloadManager(@ApplicationContext ctx: Context): ModelDownloadManager =
+        ModelDownloadManager(ctx)
 }
