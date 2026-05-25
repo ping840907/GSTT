@@ -6,7 +6,14 @@ import androidx.room.PrimaryKey
 
 @Entity(
     tableName = "dictionary",
-    indices = [Index(value = ["term"], unique = true)]
+    indices = [
+        // Deduplication — also covers WHERE term = :term in exists()
+        Index(value = ["term"], unique = true),
+        // Covers: WHERE isCandidate = 0 ORDER BY usageCount DESC (getTopTerms / observeConfirmed)
+        Index(value = ["isCandidate", "usageCount"]),
+        // Covers: WHERE isCandidate = 1 ORDER BY addedAt DESC (observeCandidates)
+        Index(value = ["isCandidate", "addedAt"])
+    ]
 )
 data class DictionaryEntry(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,

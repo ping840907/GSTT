@@ -67,15 +67,25 @@ class TranscriptionOrchestrator @Inject constructor(
         dictTerms: List<String>,
         hasScreenshot: Boolean
     ): String = buildString {
-        append("初步語音辨識：「").append(roughText).append("」\n\n")
-        if (screenText.isNotBlank()) {
-            append("畫面文字（當前 UI 上下文）：\n").append(screenText).append("\n\n")
-        }
-        if (dictTerms.isNotEmpty()) {
-            append("自訂詞彙（優先採用這些拼法）：").append(dictTerms.joinToString("、")).append("\n\n")
-        }
-        if (hasScreenshot) {
-            append("截圖已附上作為視覺情境參考。")
+        // ── 主要輸入（唯一的輸出來源）────────────────────────────────────────
+        append("【主要輸入 — 語音辨識結果】\n")
+        append("「").append(roughText).append("」\n\n")
+
+        // ── 輔助參考（僅供校正諧音/拼法，不得照抄輸出）────────────────────
+        val hasAuxiliary = screenText.isNotBlank() || dictTerms.isNotEmpty() || hasScreenshot
+        if (hasAuxiliary) {
+            append("【輔助參考資料 — 僅用於修正諧音或拼字，不得直接輸出以下任何內容】\n")
+            if (screenText.isNotBlank()) {
+                append("▸ 畫面文字（UI 上下文，辨識專有名詞用）：\n")
+                append(screenText).append("\n\n")
+            }
+            if (dictTerms.isNotEmpty()) {
+                append("▸ 自訂詞彙（遇到諧音時優先採用這些正確拼法）：")
+                append(dictTerms.joinToString("、")).append("\n\n")
+            }
+            if (hasScreenshot) {
+                append("▸ 截圖：附上作為視覺情境參考（判斷當前使用情境）。\n")
+            }
         }
     }
 
@@ -98,20 +108,27 @@ class TranscriptionOrchestrator @Inject constructor(
 
     companion object {
         private val SYSTEM_INSTRUCTION = """
-            你是一個嚴格的語音轉文字校正助手，在繁體中文環境中運作。所有處理完全在本機離線完成，不傳送任何資料。
+            你是一個嚴格的語音轉文字校正助手，在繁體中文環境中運作。所有處理完全在本機離線完成。
 
-            任務：將 Android 語音辨識的初步結果（可能有諧音或同音字錯誤）校正為精確文字。
+            ══ 核心任務 ══
+            將【主要輸入】中的語音辨識結果校正為精確文字。
+            語音辨識結果是輸出的唯一內容來源。
 
-            規則：
-            1. 嚴格保留用戶說話的語意，不添加、刪除或改變內容
-            2. 參考「畫面文字」修正可能因諧音錯誤的專有名詞（品牌、人名、地名、術語）
-            3. 若有截圖，參考畫面情境（正在使用的 App、輸入框周圍語境）輔助判斷
-            4. 優先採用「自訂詞彙」中提供的正確拼法
-            5. 若初步辨識結果明顯正確，直接輸出不做修改
+            ══ 強制限制 ══
+            • 輸出內容必須且只能源自【主要輸入】的語音辨識結果
+            • 【輔助參考資料】（畫面文字、截圖、自訂詞彙）僅用於修正諧音/拼字錯誤
+            • 嚴禁將輔助資料中的任何句子、段落或無關文字複製進輸出
+            • 嚴禁根據畫面情境自行補充、擴展或推測用戶未說出的內容
+            • 嚴禁添加、刪除或改變語意；若辨識結果已明顯正確則直接輸出
 
-            輸出格式（必須嚴格遵守，不得輸出任何其他說明）：
-            [TEXT]最終文字[/TEXT]
-            [TERMS]新識別到的特殊詞彙，逗號分隔；若無則留空[/TERMS]
+            ══ 校正規則 ══
+            1. 遇到明顯諧音字或同音字，查閱「畫面文字」或「自訂詞彙」確認正確寫法
+            2. 若有截圖，僅用於理解使用情境（正在用哪個 App、輸入框的語境），不得引用截圖文字
+            3. 「自訂詞彙」的正確拼法優先於其他來源
+
+            ══ 輸出格式（必須嚴格遵守，不得輸出任何其他說明）══
+            [TEXT]最終校正文字[/TEXT]
+            [TERMS]本次辨識到的新特殊詞彙，逗號分隔；若無則留空[/TERMS]
         """.trimIndent()
     }
 }
