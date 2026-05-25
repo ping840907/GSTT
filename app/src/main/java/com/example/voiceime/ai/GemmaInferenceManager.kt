@@ -1,6 +1,7 @@
 package com.example.voiceime.ai
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.os.Build
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
@@ -17,8 +18,8 @@ import com.google.ai.edge.litertlm.SamplerConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
-import java.lang.reflect.Constructor
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -29,30 +30,39 @@ private const val TAG = "GemmaIME"
 private const val MODEL_FILENAME = "model.litertlm"
 private const val MAX_TOKENS = 8192
 
+// Low temperature for deterministic correction; small topK still allows the
+// minor lexical variance needed to fix homophones without hallucinating.
+private const val TOP_K = 10
+private const val TOP_P = 0.95
+private const val TEMPERATURE = 0.3
+
 private enum class SocVendor { QUALCOMM, MEDIATEK, GOOGLE_TENSOR, UNKNOWN }
+
+// Sentinel thrown inside suspendCancellableCoroutine when LiteRT-LM rejects the
+// image with the pre-patch "more images than expected" error (Issue #1874).
+// Caught one frame up in transcribeOnce() to transparently retry text-only.
+private class ImageRejectedByRuntimeException : Exception()
 
 sealed class EngineState {
     object Uninitialized : EngineState()
     object Loading : EngineState()
-    data class Ready(val backend: String, val supportsAudio: Boolean) : EngineState()
+    data class Ready(val backend: String) : EngineState()
     data class Error(val message: String) : EngineState()
 }
 
 @Singleton
 class GemmaInferenceManager @Inject constructor(
-    private val context: Context
+    private val context: Context,
+    private val deviceCapability: DeviceCapability
 ) {
     private var engine: Engine? = null
     private var activeBackend: String = "CPU"
-
-    // Checked once at engine-ready time via reflection; non-null means Content.Audio is usable.
-    private var audioContentCtor: Constructor<*>? = null
 
     @Volatile
     var state: EngineState = EngineState.Uninitialized
         private set
 
-    // ── Initialization ────────────────────────────────────────────────────────
+    // ── Initialisation ────────────────────────────────────────────────────────
 
     suspend fun initialize(): EngineState = withContext(Dispatchers.IO) {
         if (state is EngineState.Ready) return@withContext state
@@ -60,55 +70,51 @@ class GemmaInferenceManager @Inject constructor(
         Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
 
         val modelPath = resolveModelPath() ?: run {
-            return@withContext EngineState.Error("找不到 $MODEL_FILENAME。請依照說明安裝模型。").also { state = it }
+            return@withContext EngineState.Error(
+                "找不到 $MODEL_FILENAME。請將模型複製到：\nAndroid/data/com.example.voiceime/files/"
+            ).also { state = it }
         }
 
         val vendor = detectSocVendor()
         val (eng, backendLabel) = tryCreateEngine(modelPath, vendor)
         if (eng == null) {
-            return@withContext EngineState.Error("模型初始化失敗，請確認裝置記憶體是否充足。").also { state = it }
+            return@withContext EngineState.Error("模型初始化失敗，請確認裝置記憶體是否充足。")
+                .also { state = it }
         }
         engine = eng
         activeBackend = backendLabel
-
-        // Probe for Content.Audio — available in LiteRT-LM when Gemma 4 audio support lands.
-        // LiteRT-LM 0.11.0 only has Text and ImageBytes; a future or custom build may add Audio.
-        audioContentCtor = probeAudioContentConstructor()
-
-        EngineState.Ready(backendLabel, audioContentCtor != null).also {
+        EngineState.Ready(backendLabel).also {
             state = it
-            Log.i(TAG, "Gemma ready — backend=$backendLabel  audioNative=${audioContentCtor != null}  model=$modelPath")
+            Log.i(TAG, "Gemma 4 E2B ready — backend=$backendLabel  model=$modelPath")
         }
     }
 
     fun isModelInstalled(): Boolean = resolveModelPath() != null
 
-    // ── Per-event stateless transcription: Audio (or text) + Screen text ──────
+    // ── Per-event stateless transcription ─────────────────────────────────────
     //
-    // Each call creates a fresh Conversation and closes it immediately after the
-    // LLM response, releasing KV-cache and all native allocations. Image input is
-    // deliberately omitted: Gemma 4 in LiteRT-LM 0.11.0 has a known crash when
-    // image content is sent (ConversationConfig doesn't expose the required prompt
-    // template placeholder; see LiteRT-LM Issue #1874).
+    // Creates a fresh Conversation for each call and closes it on completion,
+    // releasing the KV-cache and all native allocations immediately.
+    //
+    // Modality contract:
+    //   • Audio  — LiteRT-LM has no Content.Audio type. Audio is transcribed
+    //              upstream by Android's offline SpeechRecognizer and arrives
+    //              here as text already embedded in [textPrompt].
+    //   • Image  — Passed as Content.ImageBytes when [screenshot] is non-null.
+    //              The Gemma 4 image bug (Issue #1874) is fixed in current LiteRT-LM;
+    //              we still keep a graceful fallback for pre-patch builds.
+    //   • Text   — Screen text + rough ASR transcript + dictionary, all in [textPrompt].
 
-    /**
-     * @param audioWavBytes  Raw WAV bytes (16 kHz, 16-bit mono). Passed to Gemma 4 directly
-     *                       if [audioContentCtor] is non-null. Otherwise the caller should
-     *                       include a rough ASR transcript in [textPrompt] as fallback.
-     * @param textPrompt     The assembled text prompt (screen context + rough transcript +
-     *                       dictionary terms).
-     */
     suspend fun transcribeOnce(
         systemInstruction: String,
         textPrompt: String,
-        audioWavBytes: ByteArray?
+        screenshot: Bitmap?
     ): String = withContext(Dispatchers.IO) {
         val eng = engine ?: error("Engine not initialised — call initialize() first")
         var conversation: Conversation? = null
         try {
-            // Low temperature for deterministic transcription correction.
-            val samplerCfg = if (activeBackend == "NPU") null
-            else SamplerConfig(topK = 1, topP = 0.95, temperature = 0.1)
+            val samplerCfg = if (activeBackend == "NPU") null   // NPU uses fixed quantisation
+            else SamplerConfig(topK = TOP_K, topP = TOP_P, temperature = TEMPERATURE.toDouble())
 
             conversation = eng.createConversation(
                 ConversationConfig(
@@ -117,42 +123,10 @@ class GemmaInferenceManager @Inject constructor(
                 )
             )
 
-            val contentParts = buildList {
-                // Attempt native audio content if supported by current LiteRT-LM build
-                val audioCtor = audioContentCtor
-                if (audioWavBytes != null && audioCtor != null) {
-                    runCatching {
-                        @Suppress("UNCHECKED_CAST")
-                        add(audioCtor.newInstance(audioWavBytes) as Content)
-                    }.onFailure {
-                        Log.w(TAG, "Content.Audio instantiation failed: ${it.message}")
-                    }
-                }
-                add(Content.Text(textPrompt))
-            }
-
-            suspendCancellableCoroutine { cont ->
-                val active = AtomicBoolean(true)
-                val sb = StringBuilder()
-                conversation!!.sendMessageAsync(
-                    Contents.of(contentParts),
-                    object : MessageCallback {
-                        override fun onMessage(message: Message) {
-                            if (active.get()) sb.append(message.toString())
-                        }
-                        override fun onDone() {
-                            if (active.compareAndSet(true, false)) cont.resume(sb.toString().trim())
-                        }
-                        override fun onError(throwable: Throwable) {
-                            if (active.compareAndSet(true, false)) {
-                                Log.e(TAG, "Inference error", throwable)
-                                cont.resumeWithException(throwable)
-                            }
-                        }
-                    },
-                    emptyMap()
-                )
-                cont.invokeOnCancellation { active.set(false) }
+            if (screenshot != null) {
+                tryWithImage(conversation, textPrompt, screenshot)
+            } else {
+                sendText(conversation, textPrompt)
             }
         } finally {
             conversation?.close()
@@ -160,36 +134,80 @@ class GemmaInferenceManager @Inject constructor(
         }
     }
 
-    // ── Audio Content probe ───────────────────────────────────────────────────
-    //
-    // LiteRT-LM does not document Content.Audio publicly as of 0.11.0.
-    // We probe at runtime so the same APK works on both old (text-only fallback)
-    // and new (native audio) LiteRT-LM builds without recompilation.
-    //
-    // Expected signatures when available:
-    //   Content.Audio(wavBytes: ByteArray)          — WAV with embedded sample-rate
-    //   Content.Audio(pcmBytes: ByteArray, hz: Int) — Raw PCM + explicit rate
-
-    private fun probeAudioContentConstructor(): Constructor<*>? {
-        val candidates = listOf(
-            "com.google.ai.edge.litertlm.Content\$Audio" to arrayOf<Class<*>>(ByteArray::class.java),
-            "com.google.ai.edge.litertlm.Content\$Audio" to arrayOf(ByteArray::class.java, Int::class.javaPrimitiveType!!)
-        )
-        for ((cls, params) in candidates) {
-            runCatching {
-                val c = Class.forName(cls).getDeclaredConstructor(*params)
-                c.isAccessible = true
-                Log.i(TAG, "Content.Audio found with params: ${params.map { it.simpleName }}")
-                return c
-            }
+    // Attempts image + text; if the pre-patch runtime rejects the image,
+    // falls back to text-only transparently.
+    private suspend fun tryWithImage(
+        conversation: Conversation,
+        textPrompt: String,
+        bitmap: Bitmap
+    ): String {
+        // Heap guard: PNG encoding + KV-cache allocation ≈ 5× raw bitmap size.
+        val estimatedMb = (bitmap.byteCount.toLong() * 5 / 1_048_576L).toInt().coerceAtLeast(30)
+        if (!deviceCapability.hasHeapFor(estimatedMb)) {
+            Log.w(TAG, "Heap guard: skipping image  est=${estimatedMb}MB")
+            return sendText(conversation, textPrompt)
         }
-        Log.i(TAG, "Content.Audio not available in current LiteRT-LM — will use ASR fallback path")
-        return null
+
+        return try {
+            suspendCancellableCoroutine { cont ->
+                val active = AtomicBoolean(true)
+                val sb = StringBuilder()
+                val imageBytes = bitmap.toPng()
+                val contents = Contents.of(listOf(Content.ImageBytes(imageBytes), Content.Text(textPrompt)))
+
+                conversation.sendMessageAsync(contents, object : MessageCallback {
+                    override fun onMessage(message: Message) {
+                        if (active.get()) sb.append(message.toString())
+                    }
+                    override fun onDone() {
+                        if (active.compareAndSet(true, false)) cont.resume(sb.toString().trim())
+                    }
+                    override fun onError(throwable: Throwable) {
+                        if (!active.compareAndSet(true, false)) return
+                        val msg = throwable.message ?: ""
+                        if (msg.contains("more images than expected", ignoreCase = true)) {
+                            // Pre-patch build: Issue #1874 not yet applied on this device.
+                            cont.resumeWithException(ImageRejectedByRuntimeException())
+                        } else {
+                            Log.e(TAG, "Multimodal error", throwable)
+                            cont.resumeWithException(throwable)
+                        }
+                    }
+                }, emptyMap())
+                cont.invokeOnCancellation { active.set(false) }
+            }
+        } catch (_: ImageRejectedByRuntimeException) {
+            Log.i(TAG, "Image rejected by pre-patch LiteRT-LM — retrying text-only")
+            sendText(conversation, textPrompt)
+        }
     }
 
-    val nativeAudioSupported: Boolean get() = audioContentCtor != null
+    private suspend fun sendText(conversation: Conversation, textPrompt: String): String =
+        suspendCancellableCoroutine { cont ->
+            val active = AtomicBoolean(true)
+            val sb = StringBuilder()
+            conversation.sendMessageAsync(
+                Contents.of(listOf(Content.Text(textPrompt))),
+                object : MessageCallback {
+                    override fun onMessage(message: Message) {
+                        if (active.get()) sb.append(message.toString())
+                    }
+                    override fun onDone() {
+                        if (active.compareAndSet(true, false)) cont.resume(sb.toString().trim())
+                    }
+                    override fun onError(throwable: Throwable) {
+                        if (active.compareAndSet(true, false)) {
+                            Log.e(TAG, "Text inference error", throwable)
+                            cont.resumeWithException(throwable)
+                        }
+                    }
+                },
+                emptyMap()
+            )
+            cont.invokeOnCancellation { active.set(false) }
+        }
 
-    // ── Backend selection ─────────────────────────────────────────────────────
+    // ── Backend selection (mirrors gemmakey) ──────────────────────────────────
 
     private fun tryCreateEngine(modelPath: String, vendor: SocVendor): Pair<Engine?, String> {
         if (vendor == SocVendor.QUALCOMM || vendor == SocVendor.MEDIATEK) {
@@ -199,7 +217,7 @@ class GemmaInferenceManager @Inject constructor(
              .onFailure { Log.w(TAG, "NPU unavailable: ${it.message}") }
         }
         if (vendor == SocVendor.GOOGLE_TENSOR) {
-            Log.i(TAG, "Google Tensor NPU requires AOT model — falling through to GPU")
+            Log.i(TAG, "Google Tensor NPU requires AOT model — using GPU")
         }
         runCatching { buildEngine(modelPath, Backend.GPU(), Backend.CPU()) }
             .onSuccess { return it to "GPU" }
@@ -243,10 +261,15 @@ class GemmaInferenceManager @Inject constructor(
             File("/data/local/tmp", MODEL_FILENAME)
         ).firstOrNull { it.exists() && it.length() > 0 }?.absolutePath
 
+    private fun Bitmap.toPng(): ByteArray {
+        val out = ByteArrayOutputStream()
+        compress(Bitmap.CompressFormat.PNG, 100, out)
+        return out.toByteArray()
+    }
+
     fun close() {
         engine?.close()
         engine = null
-        audioContentCtor = null
         state = EngineState.Uninitialized
     }
 }

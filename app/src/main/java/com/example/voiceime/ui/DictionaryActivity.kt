@@ -3,7 +3,6 @@ package com.example.voiceime.ui
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.view.inputmethod.InputMethodManager
@@ -181,7 +180,7 @@ private fun DictionaryScreen(
             item {
                 val state = viewModel.gemmaManager.state
                 Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
                                 imageVector = when (state) {
@@ -198,10 +197,10 @@ private fun DictionaryScreen(
                             )
                             Spacer(Modifier.width(12.dp))
                             Column {
-                                Text("Gemma 4 E2B", fontWeight = FontWeight.Medium)
+                                Text("Gemma 4 E2B（LiteRT-LM）", fontWeight = FontWeight.Medium)
                                 Text(
                                     when (state) {
-                                        is EngineState.Ready -> "已就緒 (${state.backend})"
+                                        is EngineState.Ready -> "已就緒（${state.backend}）"
                                         is EngineState.Error -> state.message
                                         is EngineState.Loading -> "載入中…"
                                         else -> "未初始化（首次使用鍵盤時自動載入）"
@@ -212,23 +211,15 @@ private fun DictionaryScreen(
                             }
                         }
                         if (state is EngineState.Ready) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    imageVector = if (state.supportsAudio) Icons.Default.Mic else Icons.Default.MicOff,
-                                    contentDescription = null,
-                                    tint = if (state.supportsAudio) Color(0xFF1976D2) else Color(0xFF9E9E9E),
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    if (state.supportsAudio)
-                                        "原生音訊輸入：支援（直接傳入 Gemma 4）"
-                                    else
-                                        "原生音訊：需較新 LiteRT-LM，目前使用 ASR 轉錄後精校",
-                                    fontSize = 11.sp,
-                                    color = Color.Gray
-                                )
-                            }
+                            Text(
+                                "音訊：Android 離線 ASR → 粗轉錄 → Gemma 4 校正\n" +
+                                "影像：畫面截圖 → Content.ImageBytes（Issue #1874 已修復）\n" +
+                                "文字：無障礙服務擷取畫面上下文",
+                                fontSize = 11.sp,
+                                color = Color.Gray,
+                                lineHeight = 16.sp,
+                                modifier = Modifier.padding(start = 4.dp)
+                            )
                         }
                     }
                 }

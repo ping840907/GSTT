@@ -11,7 +11,7 @@ import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 
 private const val TAG = "ScreenContext"
-private const val SCREENSHOT_SIZE = 336
+private const val SCREENSHOT_SIZE_DEFAULT = 336
 
 class ScreenContextService : AccessibilityService() {
 
@@ -52,8 +52,11 @@ class ScreenContextService : AccessibilityService() {
         }
     }
 
-    /** Returns a [SCREENSHOT_SIZE]×[SCREENSHOT_SIZE] bitmap, or null on API < 30 or failure. */
-    suspend fun captureScreen(): Bitmap? {
+    /** Returns a bitmap scaled to [targetWidth]×[targetHeight], or null on API < 30 or failure. */
+    suspend fun captureScreen(
+        targetWidth: Int = SCREENSHOT_SIZE_DEFAULT,
+        targetHeight: Int = SCREENSHOT_SIZE_DEFAULT
+    ): Bitmap? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
         return try {
             suspendCancellableCoroutine { cont ->
@@ -66,7 +69,7 @@ class ScreenContextService : AccessibilityService() {
                             val hw = screenshot.hardwareBitmap
                             val soft = hw.copy(Bitmap.Config.ARGB_8888, false)
                             hw.recycle()
-                            val scaled = Bitmap.createScaledBitmap(soft, SCREENSHOT_SIZE, SCREENSHOT_SIZE, true)
+                            val scaled = Bitmap.createScaledBitmap(soft, targetWidth, targetHeight, true)
                             if (scaled !== soft) soft.recycle()
                             executor.shutdown()
                             cont.resume(scaled)
