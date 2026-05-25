@@ -32,6 +32,7 @@ import com.example.voiceime.ai.DeviceCapability
 import com.example.voiceime.ai.EngineState
 import com.example.voiceime.ai.GemmaInferenceManager
 import com.example.voiceime.ai.TranscriptionOrchestrator
+import com.example.voiceime.audio.AudioRecorder
 import com.example.voiceime.dictionary.DictionaryDao
 import com.example.voiceime.preferences.ModalitySettings
 import dagger.hilt.android.AndroidEntryPoint
@@ -58,6 +59,11 @@ class VoiceInputMethodService : InputMethodService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
+    // Native audio recorder (AI Edge Gallery approach) — primary path.
+    private val audioRecorder = AudioRecorder()
+    private var recordingJob: Job? = null
+
+    // SpeechRecognizer kept as fallback when audio path returns empty.
     private var speechRecognizer: SpeechRecognizer? = null
 
     // Screen context captured at recording start (UI is most stable at that moment)
@@ -99,6 +105,8 @@ class VoiceInputMethodService : InputMethodService() {
     override fun onDestroy() {
         backspaceJob?.cancel()
         backspaceJob = null
+        recordingJob?.cancel()
+        recordingJob = null
         speechRecognizer?.destroy()
         speechRecognizer = null
         capturedScreenshot?.recycle()
@@ -361,25 +369,49 @@ class VoiceInputMethodService : InputMethodService() {
             is EngineState.Ready -> { /* proceed */ }
         }
         if (isListening || isProcessing) return
-        hideCandidateBar()          // clear previous candidates when starting a new session
+        hideCandidateBar()
         isListening = true
         vibrate(25)
         setUiState(UiMode.RECORDING)
         captureContextAsync()
-        try {
-            startSpeechRecognizer()
-        } catch (e: Exception) {
-            Log.e(TAG, "SpeechRecognizer start failed", e)
-            isListening = false
-            setUiState(UiMode.IDLE)
-            toast("語音服務啟動失敗，請重試")
+        startNativeRecording()
+    }
+
+    private fun startNativeRecording() {
+        recordingJob?.cancel()
+        recordingJob = scope.launch(Dispatchers.IO) {
+            audioRecorder.start { amp ->
+                // Visualise amplitude in the status label (main-thread post).
+                val bars = "▁▂▃▄▅▆▇█"
+                val idx = (amp * (bars.length - 1)).toInt().coerceIn(0, bars.length - 1)
+                statusLabel?.post { statusLabel?.text = bars[idx].toString() }
+            }
         }
     }
 
     private fun onMicUp() {
         if (!isListening) return
         isListening = false
-        speechRecognizer?.stopListening()
+        recordingJob?.cancel()
+        recordingJob = null
+        val wavBytes = audioRecorder.stopAndGetWav()
+        if (wavBytes != null && wavBytes.size > 44 + 3200) {
+            // ≥ 0.1 s of audio (3200 bytes = 1600 samples @ 16kHz 16-bit)
+            processWithGemmaAudio(wavBytes)
+        } else {
+            // Nothing recorded — fall back to SpeechRecognizer
+            Log.w(TAG, "No audio captured, falling back to SpeechRecognizer")
+            isListening = true
+            setUiState(UiMode.RECORDING)
+            try {
+                startSpeechRecognizer()
+            } catch (e: Exception) {
+                Log.e(TAG, "SpeechRecognizer fallback failed", e)
+                isListening = false
+                setUiState(UiMode.IDLE)
+                toast("語音服務啟動失敗，請重試")
+            }
+        }
     }
 
     // ── Context capture (concurrent with recording) ───────────────────────────
@@ -477,6 +509,62 @@ class VoiceInputMethodService : InputMethodService() {
     }
 
     // ── Gemma pipeline ────────────────────────────────────────────────────────
+
+    /**
+     * Audio-native path (AI Edge Gallery approach): sends WAV bytes directly
+     * to Gemma's audio encoder via Content.AudioBytes. Falls back to
+     * SpeechRecognizer if Gemma returns an empty result.
+     */
+    private fun processWithGemmaAudio(wavBytes: ByteArray) {
+        if (isProcessing) return
+        isProcessing = true
+        setUiState(UiMode.PROCESSING)
+
+        scope.launch {
+            captureJob?.join()
+
+            val screenText = capturedScreenText
+            val screenshot = capturedScreenshot
+            capturedScreenshot = null
+            capturedScreenText = ""
+
+            val partialBuf = StringBuilder()
+            val result = orchestrator.transcribeFromAudio(wavBytes, screenText, screenshot) { token ->
+                partialBuf.append(token)
+                val preview = partialBuf.toString()
+                    .removePrefix("[TEXT]")
+                    .substringBefore("[/TEXT]")
+                    .trim()
+                    .takeLast(40)
+                if (preview.isNotBlank()) statusLabel?.post { statusLabel?.text = preview }
+            }
+
+            withContext(Dispatchers.Main) {
+                if (result.text.isNotBlank()) {
+                    currentInputConnection?.commitText(result.text, 1)
+                    lastCommittedText = result.text
+                    vibrate(18)
+                    isProcessing = false
+                    resetUi()
+                    showCandidates(result.alternatives)
+                } else {
+                    // Audio path returned nothing — fall back to SpeechRecognizer
+                    Log.w(TAG, "Audio path empty result, falling back to SpeechRecognizer")
+                    isProcessing = false
+                    isListening = true
+                    setUiState(UiMode.RECORDING)
+                    try {
+                        startSpeechRecognizer()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "SpeechRecognizer fallback failed", e)
+                        isListening = false
+                        resetUi()
+                        toast("語音辨識失敗，請重試")
+                    }
+                }
+            }
+        }
+    }
 
     private fun processWithGemma(roughText: String) {
         if (isProcessing) return

@@ -123,10 +123,97 @@ class TranscriptionOrchestrator @Inject constructor(
         return TranscriptionResult(text, alternatives, terms)
     }
 
+    /**
+     * Audio-native path: sends [wavBytes] (16kHz mono PCM WAV) directly to Gemma's
+     * audio encoder, bypassing Android SpeechRecognizer entirely.
+     *
+     * Mirrors AI Edge Gallery's Content.AudioBytes approach (LlmChatModelHelper).
+     * [screenshot] is recycled before this function returns.
+     */
+    suspend fun transcribeFromAudio(
+        wavBytes: ByteArray,
+        screenText: String,
+        screenshot: Bitmap?,
+        onPartialToken: ((String) -> Unit)? = null
+    ): TranscriptionResult = withContext(Dispatchers.IO) {
+        val dictTerms = dictionaryDao.getTopTerms(DICT_MAX_TERMS)
+        val contextPrompt = buildAudioContextPrompt(screenText.take(SCREEN_TEXT_MAX_CHARS), dictTerms, screenshot != null)
+
+        return@withContext try {
+            val raw = gemma.transcribeOnceWithAudio(
+                systemInstruction = AUDIO_SYSTEM_INSTRUCTION,
+                wavBytes = wavBytes,
+                textPrompt = contextPrompt,
+                screenshot = screenshot,
+                onPartialToken = onPartialToken
+            )
+            Log.d(TAG, "Audio path raw output:\n$raw")
+            val result = parseOutput(raw, dictionaryDao)
+            Log.d(TAG, "Audio path parsed: text='${result.text}' alts=${result.alternatives}")
+            dictTerms.filter { result.text.contains(it) }
+                .forEach { runCatching { dictionaryDao.incrementUsage(it) } }
+            result
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio path failed", e)
+            TranscriptionResult("", emptyList(), emptyList())
+        }
+        // screenshot recycled inside GemmaInferenceManager.transcribeOnceWithAudio
+    }
+
+    private fun buildAudioContextPrompt(
+        screenText: String,
+        dictTerms: List<String>,
+        hasScreenshot: Boolean
+    ): String = buildString {
+        val hasAux = screenText.isNotBlank() || dictTerms.isNotEmpty() || hasScreenshot
+        if (!hasAux) return@buildString
+
+        append("【輔助參考資料 — 僅用於修正諧音或拼字，不得直接輸出以下任何內容】\n")
+        if (screenText.isNotBlank()) {
+            append("▸ 畫面文字（UI 上下文，辨識專有名詞用）：\n")
+            append(screenText).append("\n\n")
+        }
+        if (dictTerms.isNotEmpty()) {
+            append("▸ 自訂詞彙（遇到諧音時優先採用這些正確拼法）：")
+            append(dictTerms.joinToString("、")).append("\n\n")
+        }
+        if (hasScreenshot) {
+            append("▸ 截圖：附上作為視覺情境參考（判斷當前使用情境）。\n")
+        }
+    }
+
     companion object {
         private val RE_TEXT  = Regex("\\[TEXT](.*?)\\[/TEXT]",   RegexOption.DOT_MATCHES_ALL)
         private val RE_ALTS  = Regex("\\[ALTS](.*?)\\[/ALTS]",   RegexOption.DOT_MATCHES_ALL)
         private val RE_TERMS = Regex("\\[TERMS](.*?)\\[/TERMS]", RegexOption.DOT_MATCHES_ALL)
+
+        private val AUDIO_SYSTEM_INSTRUCTION = """
+            你是一個嚴格的語音轉文字助手，在繁體中文環境中運作。所有處理完全在本機離線完成。
+
+            ══ 核心任務 ══
+            直接轉錄附上的音訊內容，輸出精確的繁體中文文字。
+
+            ══ 強制限制 ══
+            • 輸出內容必須且只能源自音訊中說出的話
+            • 【輔助參考資料】（畫面文字、截圖、自訂詞彙）僅用於修正諧音/拼字錯誤
+            • 嚴禁將輔助資料中的任何句子複製進輸出
+            • 嚴禁根據畫面情境自行補充、擴展或推測用戶未說出的內容
+            • 若辨識結果已明顯正確則直接輸出
+
+            ══ 校正規則 ══
+            1. 遇到明顯諧音字或同音字，查閱「畫面文字」或「自訂詞彙」確認正確寫法
+            2. 若有截圖，僅用於理解使用情境（正在用哪個 App、輸入框的語境），不得引用截圖文字
+            3. 「自訂詞彙」的正確拼法優先於其他來源
+
+            ══ 替代選項規則 ══
+            • [ALTS] 提供 1-2 個匹配度次高的替代選項
+            • 替代選項不得與 [TEXT] 完全相同；若無合理替代則留空
+
+            ══ 輸出格式（必須嚴格遵守，不得輸出任何其他說明）══
+            [TEXT]最終轉錄文字[/TEXT]
+            [ALTS]替代選項，以 | 分隔；無則留空[/ALTS]
+            [TERMS]本次辨識到的新特殊詞彙，逗號分隔；若無則留空[/TERMS]
+        """.trimIndent()
 
         private val SYSTEM_INSTRUCTION = """
             你是一個嚴格的語音轉文字校正助手，在繁體中文環境中運作。所有處理完全在本機離線完成。

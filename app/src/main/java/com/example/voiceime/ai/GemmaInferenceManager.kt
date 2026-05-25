@@ -161,6 +161,89 @@ class GemmaInferenceManager @Inject constructor(
         }
     }
 
+    /**
+     * Transcribes audio natively using Gemma's audio encoder.
+     *
+     * Mirrors AI Edge Gallery's LlmChatModelHelper audio path:
+     *   content = [Content.AudioBytes(wavBytes), Content.Text(textPrompt)]
+     *
+     * [wavBytes] must be a complete 44-byte RIFF/WAV file (16kHz mono PCM-16).
+     * Falls back to text-only if the runtime reports no audio support.
+     */
+    suspend fun transcribeOnceWithAudio(
+        systemInstruction: String,
+        wavBytes: ByteArray,
+        textPrompt: String,
+        screenshot: Bitmap?,
+        onPartialToken: ((String) -> Unit)? = null
+    ): String = withContext(Dispatchers.IO) {
+        val eng = engine ?: error("Engine not initialised — call initialize() first")
+        var conversation: Conversation? = null
+        try {
+            val samplerCfg = if (activeBackend == "NPU") null
+            else SamplerConfig(topK = TOP_K, topP = TOP_P, temperature = TEMPERATURE.toDouble())
+
+            conversation = eng.createConversation(
+                ConversationConfig(
+                    samplerConfig = samplerCfg,
+                    systemInstruction = Contents.of(listOf(Content.Text(systemInstruction)))
+                )
+            )
+
+            val contents = mutableListOf<Content>()
+            contents.add(Content.AudioBytes(wavBytes))
+            if (screenshot != null) {
+                val imgMb = (screenshot.byteCount.toLong() * 5 / 1_048_576L).toInt().coerceAtLeast(30)
+                if (deviceCapability.hasHeapFor(imgMb)) {
+                    contents.add(Content.ImageBytes(screenshot.toPng()))
+                } else {
+                    Log.w(TAG, "Heap guard: skipping screenshot in audio path")
+                }
+            }
+            if (textPrompt.isNotBlank()) contents.add(Content.Text(textPrompt))
+
+            suspendSendMessage(conversation, Contents.of(contents), onPartialToken)
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio inference error — retrying text-only", e)
+            // Audio token budget error or unsupported: fall back to text if we have it
+            if (textPrompt.isNotBlank() && conversation != null) {
+                sendText(conversation, textPrompt, onPartialToken)
+            } else throw e
+        } finally {
+            conversation?.close()
+            conversation = null
+            screenshot?.recycle()
+        }
+    }
+
+    private suspend fun suspendSendMessage(
+        conversation: Conversation,
+        contents: Contents,
+        onPartialToken: ((String) -> Unit)? = null
+    ): String = suspendCancellableCoroutine { cont ->
+        val active = AtomicBoolean(true)
+        val sb = StringBuilder()
+        conversation.sendMessageAsync(contents, object : MessageCallback {
+            override fun onMessage(message: Message) {
+                if (active.get()) {
+                    val token = message.toString()
+                    sb.append(token)
+                    onPartialToken?.invoke(token)
+                }
+            }
+            override fun onDone() {
+                if (active.compareAndSet(true, false)) cont.resume(sb.toString().trim())
+            }
+            override fun onError(throwable: Throwable) {
+                if (active.compareAndSet(true, false)) {
+                    Log.e(TAG, "sendMessageAsync error", throwable)
+                    cont.resumeWithException(throwable)
+                }
+            }
+        }, emptyMap())
+        cont.invokeOnCancellation { active.set(false) }
+    }
+
     // Attempts image + text; if the pre-patch runtime rejects the image,
     // falls back to text-only transparently.
     private suspend fun tryWithImage(
@@ -251,7 +334,7 @@ class GemmaInferenceManager @Inject constructor(
     private fun tryCreateEngine(modelPath: String, vendor: SocVendor): Pair<Engine?, String> {
         if (vendor == SocVendor.QUALCOMM || vendor == SocVendor.MEDIATEK) {
             runCatching {
-                buildEngine(modelPath, Backend.NPU(context.applicationInfo.nativeLibraryDir), Backend.CPU())
+                buildEngine(modelPath, Backend.NPU(context.applicationInfo.nativeLibraryDir), Backend.CPU(), enableAudio = true)
             }.onSuccess { return it to "NPU" }
              .onFailure { Log.w(TAG, "NPU unavailable: ${it.message}") }
         }
@@ -259,20 +342,27 @@ class GemmaInferenceManager @Inject constructor(
             Log.i(TAG, "Google Tensor NPU requires AOT model — using GPU")
         }
         // Both compute and vision backend use GPU for correct multimodal performance.
-        runCatching { buildEngine(modelPath, Backend.GPU(), Backend.GPU()) }
+        runCatching { buildEngine(modelPath, Backend.GPU(), Backend.GPU(), enableAudio = true) }
             .onSuccess { return it to "GPU" }
             .onFailure { Log.w(TAG, "GPU unavailable: ${it.message}") }
-        runCatching { buildEngine(modelPath, Backend.CPU(), Backend.CPU()) }
+        runCatching { buildEngine(modelPath, Backend.CPU(), Backend.CPU(), enableAudio = true) }
             .onSuccess { return it to "CPU" }
             .onFailure { Log.e(TAG, "CPU also failed: ${it.message}") }
         return null to "CPU"
     }
 
-    private fun buildEngine(modelPath: String, backend: Backend, visionBackend: Backend): Engine {
+    private fun buildEngine(
+        modelPath: String,
+        backend: Backend,
+        visionBackend: Backend,
+        enableAudio: Boolean = false
+    ): Engine {
         val cfg = EngineConfig(
             modelPath = modelPath,
             backend = backend,
             visionBackend = visionBackend,
+            // Audio encoder must always run on CPU per AI Edge Gallery constraint.
+            audioBackend = if (enableAudio) Backend.CPU() else null,
             maxNumTokens = MAX_TOKENS,
             cacheDir = if (modelPath.startsWith("/data/local/tmp"))
                 context.getExternalFilesDir(null)?.absolutePath else null
