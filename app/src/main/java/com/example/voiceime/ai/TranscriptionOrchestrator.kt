@@ -1,6 +1,5 @@
 package com.example.voiceime.ai
 
-import android.graphics.Bitmap
 import android.util.Log
 import com.example.voiceime.dictionary.DictionaryDao
 import kotlinx.coroutines.Dispatchers
@@ -9,7 +8,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 private const val TAG = "Transcription"
-private const val SCREEN_TEXT_MAX_CHARS = 800
+private const val SCREEN_TEXT_MAX_CHARS = 600
 private const val DICT_MAX_TERMS = 50
 
 data class TranscriptionResult(
@@ -23,55 +22,78 @@ class TranscriptionOrchestrator @Inject constructor(
     private val dictionaryDao: DictionaryDao
 ) {
     /**
-     * Refines [roughText] (from Android SpeechRecognizer) using:
-     *  - [screenshot]: low-res current screen image (nullable, freed inside this call)
-     *  - [screenText]: text extracted from accessibility node tree
+     * Transcribes user speech using Gemma 4 E2B.
      *
-     * Contract: [screenshot] is recycled before this function returns. No references escape.
+     * Modality priority (audio > text context, image dropped due to LiteRT-LM Gemma 4 bug):
+     *
+     *   Path A — Native audio (requires LiteRT-LM with Gemma 4 audio support):
+     *     [audioWavBytes] + screen text → Gemma 4 E2B
+     *     Gemma receives the raw WAV directly and transcribes without pre-processing.
+     *
+     *   Path B — ASR fallback (LiteRT-LM 0.11.0 without Content.Audio):
+     *     [roughTextFallback] + screen text → Gemma 4 E2B for correction
+     *     Rough text comes from Android's offline SpeechRecognizer in the calling layer.
+     *
+     * [audioWavBytes] is cleared from memory inside this function (array reference dropped).
      */
     suspend fun transcribe(
-        roughText: String,
-        screenText: String,
-        screenshot: Bitmap?
+        audioWavBytes: ByteArray?,
+        roughTextFallback: String,
+        screenText: String
     ): TranscriptionResult = withContext(Dispatchers.IO) {
-        if (roughText.isBlank()) return@withContext TranscriptionResult("", emptyList())
+        if (audioWavBytes == null && roughTextFallback.isBlank()) {
+            return@withContext TranscriptionResult("", emptyList())
+        }
 
         val dictTerms = dictionaryDao.getTopTerms(DICT_MAX_TERMS)
         val trimmedScreenText = screenText.take(SCREEN_TEXT_MAX_CHARS)
+        val usingNativeAudio = audioWavBytes != null && gemma.nativeAudioSupported
 
-        val prompt = buildUserPrompt(roughText, trimmedScreenText, dictTerms)
+        val textPrompt = buildTextPrompt(
+            roughText = if (usingNativeAudio) null else roughTextFallback,
+            screenText = trimmedScreenText,
+            dictTerms = dictTerms,
+            nativeAudio = usingNativeAudio
+        )
+
+        val system = if (usingNativeAudio) SYSTEM_NATIVE_AUDIO else SYSTEM_ASR_CORRECTION
 
         return@withContext try {
             val raw = gemma.transcribeOnce(
-                systemInstruction = SYSTEM_INSTRUCTION,
-                textPrompt = prompt,
-                screenshot = screenshot
+                systemInstruction = system,
+                textPrompt = textPrompt,
+                audioWavBytes = if (usingNativeAudio) audioWavBytes else null
             )
             parseGemmaOutput(raw, dictionaryDao)
         } catch (e: Exception) {
-            Log.e(TAG, "Gemma transcription failed, falling back to raw ASR result", e)
-            TranscriptionResult(roughText, emptyList())
-        } finally {
-            screenshot?.recycle()
+            Log.e(TAG, "Gemma failed — returning rough fallback", e)
+            TranscriptionResult(roughTextFallback, emptyList())
         }
+        // audioWavBytes reference is not stored; GC will reclaim after this scope exits.
     }
 
-    private fun buildUserPrompt(
-        roughText: String,
+    private fun buildTextPrompt(
+        roughText: String?,
         screenText: String,
-        dictTerms: List<String>
+        dictTerms: List<String>,
+        nativeAudio: Boolean
     ): String = buildString {
-        append("初步語音辨識：「").append(roughText).append("」\n\n")
+        if (!nativeAudio && !roughText.isNullOrBlank()) {
+            append("初步語音辨識：「").append(roughText).append("」\n\n")
+        }
         if (screenText.isNotBlank()) {
-            append("畫面文字（當前 UI 內容）：\n").append(screenText).append("\n\n")
+            append("畫面文字（當前 UI 上下文，可用於修正專有名詞）：\n").append(screenText).append("\n\n")
         }
         if (dictTerms.isNotEmpty()) {
             append("自訂詞彙（優先採用這些拼法）：").append(dictTerms.joinToString("、")).append("\n\n")
         }
-        append("截圖已附上作為視覺上下文參考（如有）。")
+        if (nativeAudio) {
+            append("語音已隨附，請直接辨識並校正後輸出。")
+        } else {
+            append("請根據初步辨識結果和畫面文字校正輸出。")
+        }
     }
 
-    /** Parses structured Gemma output and side-effects new candidate terms into the DB */
     private suspend fun parseGemmaOutput(raw: String, dao: DictionaryDao): TranscriptionResult {
         val textMatch = Regex("\\[TEXT](.*?)\\[/TEXT]", RegexOption.DOT_MATCHES_ALL)
             .find(raw)?.groupValues?.get(1)?.trim()
@@ -86,29 +108,43 @@ class TranscriptionOrchestrator @Inject constructor(
             ?.filter { it.length in 2..20 && it.isNotBlank() }
             ?: emptyList()
 
-        detectedTerms.forEach { term ->
-            runCatching { dao.addCandidateTerm(term) }
-        }
+        detectedTerms.forEach { term -> runCatching { dao.addCandidateTerm(term) } }
 
         return TranscriptionResult(finalText, detectedTerms)
     }
 
     companion object {
-        // Low temperature (0.1) is set in GemmaInferenceManager for deterministic correction.
-        // The structured output tags prevent Gemma from adding explanatory prose.
-        private val SYSTEM_INSTRUCTION = """
-            你是一個嚴格的語音轉文字校正助手，在繁體中文環境中運作。所有處理完全離線，不傳送任何資料。
+        // Native audio path: Gemma 4 directly transcribes the WAV.
+        // Low temperature (via topK=1) enforces deterministic, literal output.
+        private val SYSTEM_NATIVE_AUDIO = """
+            你是一個嚴格的語音轉文字助手，在繁體中文環境中運作。所有處理完全在本機完成，不傳送任何資料。
 
-            任務：將有誤的初步語音辨識結果校正為正確文字。
+            任務：辨識所附語音，輸出精確的繁體中文（或其他語言）文字。
 
             規則：
-            1. 嚴格保留用戶說話的語意，不得添加、刪除或改變內容
-            2. 參考「畫面文字」修正可能因諧音錯誤的專有名詞（品牌、人名、地名、術語）
-            3. 參考截圖了解當前使用情境（正在使用的 App、輸入框周圍的語境）
-            4. 優先採用「自訂詞彙」中提供的正確拼法
-            5. 若無需修正，直接輸出原文
+            1. 嚴格輸出用戶說的內容，不添加、刪改或延伸
+            2. 參考「畫面文字」修正可能因諧音誤判的專有名詞
+            3. 優先採用「自訂詞彙」中的正確拼法
+            4. 若語音混合多語，依實際發音輸出對應語言文字
 
-            輸出格式（必須嚴格遵守，不得輸出任何其他內容）：
+            輸出格式（必須嚴格遵守）：
+            [TEXT]最終文字[/TEXT]
+            [TERMS]新識別到的特殊詞彙，逗號分隔；若無則留空[/TERMS]
+        """.trimIndent()
+
+        // ASR-fallback path: Gemma 4 corrects Android SpeechRecognizer's rough output.
+        private val SYSTEM_ASR_CORRECTION = """
+            你是一個嚴格的語音轉文字校正助手，在繁體中文環境中運作。所有處理完全在本機完成，不傳送任何資料。
+
+            任務：將 Android 語音辨識的初步結果（可能有諧音錯誤）校正為精確文字。
+
+            規則：
+            1. 嚴格保留原始語意，不添加或刪除用戶未說的內容
+            2. 參考「畫面文字」修正可能因諧音誤判的專有名詞
+            3. 優先採用「自訂詞彙」中的正確拼法
+            4. 若初步辨識明顯正確，直接輸出不做修改
+
+            輸出格式（必須嚴格遵守）：
             [TEXT]最終文字[/TEXT]
             [TERMS]新識別到的特殊詞彙，逗號分隔；若無則留空[/TERMS]
         """.trimIndent()

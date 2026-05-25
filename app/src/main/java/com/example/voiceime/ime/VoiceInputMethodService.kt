@@ -2,13 +2,11 @@ package com.example.voiceime.ime
 
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.inputmethodservice.InputMethodService
 import android.os.Bundle
 import android.os.VibrationEffect
-import android.os.Vibrator
 import android.os.VibratorManager
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -25,16 +23,20 @@ import android.widget.TextView
 import android.widget.Toast
 import com.example.voiceime.R
 import com.example.voiceime.accessibility.ScreenContextService
+import com.example.voiceime.ai.EngineState
 import com.example.voiceime.ai.GemmaInferenceManager
 import com.example.voiceime.ai.TranscriptionOrchestrator
+import com.example.voiceime.audio.AudioCaptureManager
 import com.example.voiceime.dictionary.DictionaryDao
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 
 private const val TAG = "VoiceIME"
@@ -44,132 +46,201 @@ class VoiceInputMethodService : InputMethodService() {
 
     @Inject lateinit var gemmaManager: GemmaInferenceManager
     @Inject lateinit var orchestrator: TranscriptionOrchestrator
+    @Inject lateinit var audioCapture: AudioCaptureManager
     @Inject lateinit var dictionaryDao: DictionaryDao
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
+    // Atomic flag set to true when the user releases the mic button, signalling AudioRecord to stop
+    private val stopRecording = AtomicBoolean(false)
+
+    private var recordingJob: Job? = null
     private var speechRecognizer: SpeechRecognizer? = null
+
     private var statusLabel: TextView? = null
     private var micButton: ImageButton? = null
     private var progressBar: ProgressBar? = null
+    private var audioIndicator: View? = null
 
-    private var isListening = false
+    private var isRecording = false
     private var isProcessing = false
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
-        initGemmaAsync()
+        scope.launch(Dispatchers.IO) { gemmaManager.initialize() }
     }
 
-    private fun initGemmaAsync() = scope.launch {
-        withContext(Dispatchers.IO) { gemmaManager.initialize() }
-        Log.i(TAG, "Gemma init done: ${gemmaManager.state}")
+    override fun onDestroy() {
+        speechRecognizer?.destroy()
+        speechRecognizer = null
+        scope.cancel()
+        super.onDestroy()
     }
 
-    // ── IME view ──────────────────────────────────────────────────────────────
+    // ── IME keyboard view ─────────────────────────────────────────────────────
 
-    override fun onCreateInputView(): View {
-        return buildKeyboardView()
-    }
+    override fun onCreateInputView(): View = buildKeyboardView()
 
     private fun buildKeyboardView(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#F5F5F5"))
+            setBackgroundColor(Color.parseColor("#FAFAFA"))
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
-                dpToPx(180)
+                dpToPx(192)
             )
         }
 
+        // Status label row
         statusLabel = TextView(this).apply {
-            text = getString(R.string.tap_to_speak)
-            textSize = 14f
+            text = statusText()
+            textSize = 13f
             setTextColor(Color.DKGRAY)
             gravity = Gravity.CENTER
-            setPadding(0, dpToPx(12), 0, 0)
+            setPadding(0, dpToPx(10), 0, 0)
         }
         root.addView(statusLabel, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ))
 
+        // Indeterminate progress bar (hidden until processing)
         progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             isIndeterminate = true
             visibility = View.INVISIBLE
         }
         root.addView(progressBar, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dpToPx(4)
-        ).also { it.setMargins(dpToPx(32), dpToPx(4), dpToPx(32), 0) })
+            LinearLayout.LayoutParams.MATCH_PARENT, dpToPx(3)
+        ).also { it.setMargins(dpToPx(40), dpToPx(2), dpToPx(40), 0) })
 
-        val micContainer = FrameLayout(this)
-        micButton = ImageButton(this).apply {
-            setImageResource(android.R.drawable.ic_btn_speak_now)
-            contentDescription = getString(R.string.tap_to_speak)
+        // Mic button (centered)
+        val micFrame = FrameLayout(this)
+
+        // Pulsing ring shown while recording
+        audioIndicator = View(this).apply {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#1976D2"))
+                setColor(Color.parseColor("#33FF5252"))
             }
-            setPadding(dpToPx(20), dpToPx(20), dpToPx(20), dpToPx(20))
-            setColorFilter(Color.WHITE)
+            visibility = View.INVISIBLE
+        }
+        micFrame.addView(audioIndicator, FrameLayout.LayoutParams(
+            dpToPx(88), dpToPx(88), Gravity.CENTER
+        ))
 
+        micButton = ImageButton(this).apply {
+            setImageResource(android.R.drawable.ic_btn_speak_now)
+            contentDescription = getString(R.string.hold_to_speak)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(micColor())
+            }
+            setPadding(dpToPx(18), dpToPx(18), dpToPx(18), dpToPx(18))
+            setColorFilter(Color.WHITE)
             setOnTouchListener { _, event ->
                 when (event.action) {
-                    MotionEvent.ACTION_DOWN -> { startListening(); true }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { stopListening(); true }
+                    MotionEvent.ACTION_DOWN -> { onMicPressed(); true }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { onMicReleased(); true }
                     else -> false
                 }
             }
         }
-        micContainer.addView(micButton, FrameLayout.LayoutParams(
+        micFrame.addView(micButton, FrameLayout.LayoutParams(
             dpToPx(72), dpToPx(72), Gravity.CENTER
         ))
-        root.addView(micContainer, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            0, 1f
+
+        root.addView(micFrame, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
         ))
 
-        val hintsRow = LinearLayout(this).apply {
+        // Bottom toolbar
+        val toolbar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dpToPx(8))
+            setPadding(dpToPx(8), 0, dpToPx(8), dpToPx(8))
         }
-
-        val dictBtn = TextView(this).apply {
+        toolbar.addView(TextView(this).apply {
             text = "📖 字典"
             textSize = 12f
-            setTextColor(Color.parseColor("#1976D2"))
+            setTextColor(Color.parseColor("#1565C0"))
             setPadding(dpToPx(16), dpToPx(8), dpToPx(16), dpToPx(8))
             setOnClickListener { openDictionary() }
-        }
-        hintsRow.addView(dictBtn)
-
-        root.addView(hintsRow, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
+        })
+        root.addView(toolbar, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ))
 
         return root
     }
 
-    // ── Speech recognition ────────────────────────────────────────────────────
+    // ── Input handling ─────────────────────────────────────────────────────────
 
-    private fun startListening() {
-        if (isListening || isProcessing) return
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            toast(getString(R.string.transcription_failed))
+    private fun onMicPressed() {
+        if (isRecording || isProcessing) return
+        if (!audioCapture.hasMicPermission) {
+            toast(getString(R.string.mic_permission_required))
             return
         }
 
-        isListening = true
-        vibrate(30)
-        setStatus(getString(R.string.recording))
-        micButton?.setColorFilter(Color.parseColor("#FF5252"))
+        isRecording = true
+        stopRecording.set(false)
+        vibrate(25)
+        updateUI(recording = true)
+
+        // Decide path: native AudioRecord (preferred) or Android SpeechRecognizer fallback.
+        // We always record via AudioRecord regardless, but also run SpeechRecognizer in parallel
+        // as the ASR fallback in case Content.Audio isn't supported by current LiteRT-LM.
+        startAudioRecord()
+        if (!gemmaManager.nativeAudioSupported) {
+            startSpeechRecognizer()
+        }
+    }
+
+    private fun onMicReleased() {
+        if (!isRecording) return
+        isRecording = false
+        stopRecording.set(true)
+        speechRecognizer?.stopListening()
+        updateUI(recording = false, processing = true)
+    }
+
+    // ── AudioRecord path ──────────────────────────────────────────────────────
+
+    private fun startAudioRecord() {
+        recordingJob = scope.launch {
+            val pcm = audioCapture.record(stopSignal = { stopRecording.get() })
+            val wav = pcm?.let { audioCapture.pcmToWav(it) }
+
+            // Only dispatch Gemma processing here if NOT using SpeechRecognizer fallback
+            // (i.e., native audio is supported). The SpeechRecognizer path dispatches from onResults.
+            if (gemmaManager.nativeAudioSupported) {
+                processWithGemma(audioWavBytes = wav, roughText = "")
+            }
+            // If ASR fallback: wav is still captured but SpeechRecognizer drives the Gemma call.
+            // wav reference is dropped here — GC reclaims it when processWithGemma is done.
+        }
+    }
+
+    // ── SpeechRecognizer fallback path ────────────────────────────────────────
+    //
+    // Used when Content.Audio is unavailable in current LiteRT-LM. Android's offline
+    // SpeechRecognizer provides a rough transcript which Gemma 4 then corrects
+    // using the screen text context.
+
+    private var asrRoughText = ""
+
+    private fun startSpeechRecognizer() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) return
+        asrRoughText = ""
 
         if (speechRecognizer == null) {
-            speechRecognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
-                .also { sr -> sr.setRecognitionListener(buildRecognitionListener()) }
+            // Use createOnDeviceSpeechRecognizer when available for true offline operation.
+            speechRecognizer = runCatching {
+                SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+            }.getOrElse {
+                SpeechRecognizer.createSpeechRecognizer(this)
+            }.also { it.setRecognitionListener(buildAsrListener()) }
         }
 
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -178,134 +249,128 @@ class VoiceInputMethodService : InputMethodService() {
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
+            // Extended silence tolerance for hold-to-speak pattern
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
         }
         speechRecognizer?.startListening(intent)
     }
 
-    private fun stopListening() {
-        if (!isListening) return
-        // SpeechRecognizer delivers final results via onResults even after stopListening
-        speechRecognizer?.stopListening()
-    }
-
-    private fun buildRecognitionListener() = object : RecognitionListener {
+    private fun buildAsrListener() = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {}
         override fun onBeginningOfSpeech() {}
         override fun onRmsChanged(rmsdB: Float) {}
         override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() {
-            isListening = false
-            micButton?.setColorFilter(Color.WHITE)
-            setStatus(getString(R.string.processing))
+        override fun onEndOfSpeech() {}
+        override fun onPartialResults(partial: Bundle?) {
+            partial?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()?.let { asrRoughText = it }
         }
-        override fun onPartialResults(partialResults: Bundle?) {}
-
         override fun onResults(results: Bundle?) {
-            isListening = false
-            micButton?.setColorFilter(Color.WHITE)
-            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val roughText = matches?.firstOrNull()?.trim() ?: ""
-            if (roughText.isBlank()) {
+            val best = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()?.trim() ?: asrRoughText
+            // Dispatch Gemma call with rough text; AudioRecord wav may be nil if recording
+            // finished before SpeechRecognizer returned results.
+            if (best.isNotBlank() || asrRoughText.isNotBlank()) {
+                processWithGemma(audioWavBytes = null, roughText = best.ifBlank { asrRoughText })
+            } else {
                 resetUI()
                 toast(getString(R.string.transcription_failed))
-                return
             }
-            processWithGemma(roughText)
         }
-
         override fun onError(error: Int) {
-            isListening = false
-            micButton?.setColorFilter(Color.WHITE)
-            resetUI()
-            val msg = when (error) {
-                SpeechRecognizer.ERROR_NO_MATCH -> "未辨識到語音，請再試一次"
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "語音輸入逾時"
-                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "辨識器忙碌中"
-                SpeechRecognizer.ERROR_NOT_SUPPORTED -> "不支援離線辨識，請安裝語言包"
-                else -> "語音辨識錯誤（$error）"
+            Log.w(TAG, "ASR error $error — processing with empty rough text")
+            // Still attempt Gemma with whatever partial text we have
+            if (asrRoughText.isNotBlank()) {
+                processWithGemma(audioWavBytes = null, roughText = asrRoughText)
+            } else {
+                resetUI()
+                toast("語音辨識失敗 ($error)，請再試")
             }
-            toast(msg)
-            Log.w(TAG, "SpeechRecognizer error: $error")
         }
-
         override fun onEvent(eventType: Int, params: Bundle?) {}
     }
 
-    // ── Gemma refinement pipeline ─────────────────────────────────────────────
+    // ── Gemma processing pipeline ─────────────────────────────────────────────
 
-    private fun processWithGemma(roughText: String) {
+    private fun processWithGemma(audioWavBytes: ByteArray?, roughText: String) {
         if (isProcessing) return
         isProcessing = true
-        setStatus(getString(R.string.processing))
-        progressBar?.visibility = View.VISIBLE
-        micButton?.isEnabled = false
+        updateUI(processing = true)
 
         scope.launch {
-            val accessibility = ScreenContextService.instance
-            // Capture screen context concurrently while still on main thread
-            val screenText = accessibility?.getScreenText() ?: ""
-            val screenshot: Bitmap? = accessibility?.captureScreen()
+            val screenText = ScreenContextService.instance?.getScreenText() ?: ""
 
-            val result = orchestrator.transcribe(roughText, screenText, screenshot)
-            // screenshot is recycled inside orchestrator.transcribe()
+            val result = orchestrator.transcribe(
+                audioWavBytes = audioWavBytes,
+                roughTextFallback = roughText,
+                screenText = screenText
+            )
+            // audioWavBytes reference is cleared inside orchestrator
 
             withContext(Dispatchers.Main) {
                 if (result.text.isNotBlank()) {
                     currentInputConnection?.commitText(result.text, 1)
-                    vibrate(20)
+                    vibrate(18)
                 }
-                resetUI()
                 isProcessing = false
+                resetUI()
             }
         }
     }
 
     // ── UI helpers ────────────────────────────────────────────────────────────
 
-    private fun resetUI() {
-        setStatus(getString(R.string.tap_to_speak))
-        progressBar?.visibility = View.INVISIBLE
-        micButton?.isEnabled = true
-        micButton?.setColorFilter(Color.WHITE)
+    private fun updateUI(recording: Boolean = false, processing: Boolean = false) {
+        statusLabel?.text = when {
+            recording -> getString(R.string.recording)
+            processing -> getString(R.string.processing)
+            else -> statusText()
+        }
+        progressBar?.visibility = if (processing) View.VISIBLE else View.INVISIBLE
+        audioIndicator?.visibility = if (recording) View.VISIBLE else View.INVISIBLE
+        (micButton?.background as? GradientDrawable)?.setColor(
+            when {
+                recording -> Color.parseColor("#E53935")
+                processing -> Color.parseColor("#757575")
+                else -> Color.parseColor("#1565C0")
+            }
+        )
+        micButton?.isEnabled = !processing
     }
 
-    private fun setStatus(text: String) {
-        statusLabel?.text = text
+    private fun resetUI() {
+        statusLabel?.text = statusText()
+        progressBar?.visibility = View.INVISIBLE
+        audioIndicator?.visibility = View.INVISIBLE
+        (micButton?.background as? GradientDrawable)?.setColor(micColor())
+        micButton?.isEnabled = true
     }
+
+    private fun statusText(): String {
+        val state = gemmaManager.state
+        return when {
+            state is EngineState.Error -> "⚠ 模型錯誤"
+            state is EngineState.Loading -> getString(R.string.model_loading)
+            state is EngineState.Ready && state.supportsAudio -> getString(R.string.hold_to_speak)
+            state is EngineState.Ready -> getString(R.string.hold_to_speak) + "（ASR模式）"
+            else -> getString(R.string.model_loading)
+        }
+    }
+
+    private fun micColor() = Color.parseColor("#1565C0")
 
     private fun openDictionary() {
-        val intent = Intent(this, com.example.voiceime.ui.DictionaryActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        startActivity(intent)
+        startActivity(Intent(this, com.example.voiceime.ui.DictionaryActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
-    private fun vibrate(ms: Long) {
-        runCatching {
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-                val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
-                vm.defaultVibrator.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
-            } else {
-                @Suppress("DEPRECATION")
-                (getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator)
-                    ?.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
-            }
-        }
+    private fun vibrate(ms: Long) = runCatching {
+        (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager)
+            .defaultVibrator
+            .vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
     }
 
-    private fun dpToPx(dp: Int): Int =
-        (dp * resources.displayMetrics.density + 0.5f).toInt()
-
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
-
-    override fun onDestroy() {
-        speechRecognizer?.destroy()
-        speechRecognizer = null
-        scope.cancel()
-        super.onDestroy()
-    }
+    private fun dpToPx(dp: Int) = (dp * resources.displayMetrics.density + 0.5f).toInt()
 }

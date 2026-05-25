@@ -2,6 +2,7 @@ package com.example.voiceime.di
 
 import android.content.Context
 import com.example.voiceime.ai.GemmaInferenceManager
+import com.example.voiceime.audio.AudioCaptureManager
 import com.example.voiceime.dictionary.DictionaryDao
 import com.example.voiceime.dictionary.DictionaryDatabase
 import dagger.Module
@@ -27,4 +28,9 @@ object AppModule {
     @Singleton
     fun provideGemmaInferenceManager(@ApplicationContext ctx: Context): GemmaInferenceManager =
         GemmaInferenceManager(ctx)
+
+    @Provides
+    @Singleton
+    fun provideAudioCaptureManager(@ApplicationContext ctx: Context): AudioCaptureManager =
+        AudioCaptureManager(ctx)
 }

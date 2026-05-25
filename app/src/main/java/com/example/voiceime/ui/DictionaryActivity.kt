@@ -181,36 +181,54 @@ private fun DictionaryScreen(
             item {
                 val state = viewModel.gemmaManager.state
                 Card(modifier = Modifier.fillMaxWidth()) {
-                    Row(
-                        Modifier.padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = when (state) {
-                                is EngineState.Ready -> Icons.Default.CheckCircle
-                                is EngineState.Error -> Icons.Default.Error
-                                else -> Icons.Default.HourglassEmpty
-                            },
-                            contentDescription = null,
-                            tint = when (state) {
-                                is EngineState.Ready -> Color(0xFF4CAF50)
-                                is EngineState.Error -> Color(0xFFE53935)
-                                else -> Color(0xFFFFA000)
-                            }
-                        )
-                        Spacer(Modifier.width(12.dp))
-                        Column {
-                            Text("Gemma 模型", fontWeight = FontWeight.Medium)
-                            Text(
-                                when (state) {
-                                    is EngineState.Ready -> "已就緒 (${state.backend})"
-                                    is EngineState.Error -> state.message
-                                    is EngineState.Loading -> "載入中…"
-                                    else -> "未初始化（首次使用鍵盤時自動載入）"
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = when (state) {
+                                    is EngineState.Ready -> Icons.Default.CheckCircle
+                                    is EngineState.Error -> Icons.Default.Error
+                                    else -> Icons.Default.HourglassEmpty
                                 },
-                                fontSize = 12.sp,
-                                color = Color.Gray
+                                contentDescription = null,
+                                tint = when (state) {
+                                    is EngineState.Ready -> Color(0xFF4CAF50)
+                                    is EngineState.Error -> Color(0xFFE53935)
+                                    else -> Color(0xFFFFA000)
+                                }
                             )
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                Text("Gemma 4 E2B", fontWeight = FontWeight.Medium)
+                                Text(
+                                    when (state) {
+                                        is EngineState.Ready -> "已就緒 (${state.backend})"
+                                        is EngineState.Error -> state.message
+                                        is EngineState.Loading -> "載入中…"
+                                        else -> "未初始化（首次使用鍵盤時自動載入）"
+                                    },
+                                    fontSize = 12.sp,
+                                    color = Color.Gray
+                                )
+                            }
+                        }
+                        if (state is EngineState.Ready) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = if (state.supportsAudio) Icons.Default.Mic else Icons.Default.MicOff,
+                                    contentDescription = null,
+                                    tint = if (state.supportsAudio) Color(0xFF1976D2) else Color(0xFF9E9E9E),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    if (state.supportsAudio)
+                                        "原生音訊輸入：支援（直接傳入 Gemma 4）"
+                                    else
+                                        "原生音訊：需較新 LiteRT-LM，目前使用 ASR 轉錄後精校",
+                                    fontSize = 11.sp,
+                                    color = Color.Gray
+                                )
+                            }
                         }
                     }
                 }
