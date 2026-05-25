@@ -83,12 +83,16 @@ class VoiceInputMethodService : InputMethodService() {
     private var micButton: ImageButton? = null
     private var progressBar: ProgressBar? = null
     private var pulseRing: View? = null
+    private var backendChip: TextView? = null
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
-        scope.launch(Dispatchers.IO) { gemmaManager.initialize() }
+        scope.launch(Dispatchers.IO) {
+            gemmaManager.initialize()
+            withContext(Dispatchers.Main) { updateBackendChip() }
+        }
     }
 
     override fun onDestroy() {
@@ -282,18 +286,31 @@ class VoiceInputMethodService : InputMethodService() {
             LinearLayout.LayoutParams(dp(80), dp(44)))
         root.addView(funcRow, LinearLayout.LayoutParams(mp, wc))
 
-        // ── Dictionary bar ────────────────────────────────────────────────────
+        // ── Bottom bar: [📖 字典] ───────── [backend chip] ───────────────────
         val bar = LinearLayout(this).apply {
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dp(8))
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), 0, dp(12), dp(8))
         }
         bar.addView(TextView(this).apply {
             text = "📖 字典"
             textSize = 12f
             setTextColor(Color.parseColor("#1565C0"))
-            setPadding(dp(16), dp(6), dp(16), dp(6))
+            setPadding(dp(12), dp(6), dp(12), dp(6))
             setOnClickListener { openDictionary() }
-        })
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        bar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))   // spacer
+        backendChip = TextView(this).apply {
+            textSize = 11f
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(10).toFloat()
+            }
+            visibility = View.INVISIBLE
+        }
+        updateBackendChip()
+        bar.addView(backendChip, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         root.addView(bar, LinearLayout.LayoutParams(mp, wc))
 
         return root
@@ -540,7 +557,25 @@ class VoiceInputMethodService : InputMethodService() {
         micButton?.isEnabled = mode == UiMode.IDLE
     }
 
-    private fun resetUi() = setUiState(UiMode.IDLE)
+    private fun resetUi() {
+        setUiState(UiMode.IDLE)
+        updateBackendChip()
+    }
+
+    private fun updateBackendChip() {
+        val chip = backendChip ?: return
+        val s = gemmaManager.state
+        if (s !is EngineState.Ready) { chip.visibility = View.INVISIBLE; return }
+        val (label, textColor, bgColor) = when (s.backend) {
+            "NPU" -> Triple("⚡ NPU", Color.parseColor("#1B5E20"), Color.parseColor("#E8F5E9"))
+            "GPU" -> Triple("⚡ GPU", Color.parseColor("#0D47A1"), Color.parseColor("#E3F2FD"))
+            else  -> Triple("CPU",   Color.parseColor("#616161"), Color.parseColor("#EEEEEE"))
+        }
+        chip.text = label
+        chip.setTextColor(textColor)
+        (chip.background as? GradientDrawable)?.setColor(bgColor)
+        chip.visibility = View.VISIBLE
+    }
 
     private fun idleStatus(): String = when (val s = gemmaManager.state) {
         is EngineState.Ready -> getString(R.string.hold_to_speak)
