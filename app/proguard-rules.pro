@@ -1,0 +1,3 @@
+-keep class com.google.ai.edge.litertlm.** { *; }
+-keep class com.example.voiceime.dictionary.** { *; }
+-dontwarn com.google.ai.edge.**
